@@ -7,6 +7,7 @@ read-only / single-statement isolation.
 
 from __future__ import annotations
 
+import json
 import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -414,10 +415,60 @@ class DynamicDataMasker:
     def is_sensitive_column(self, col_name: str) -> bool:
         if not self.enabled or not col_name:
             return False
-        low = col_name.lower().strip()
-        if low in self.exempt:
+        raw = col_name.strip()
+        # Normalize camelCase / PascalCase (e.g. mobilePhone -> mobile_phone, idCardNo -> id_card_no)
+        snake = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", raw).lower()
+        low = raw.lower()
+        if low in self.exempt or snake in self.exempt:
             return False
-        return any(rx.search(low) for rx in self.col_regexes)
+        return any(rx.search(low) or rx.search(snake) for rx in self.col_regexes)
+
+    def _mask_json_node(self, node: Any, parent_sensitive: bool = False) -> Tuple[Any, bool]:
+        changed = False
+        if isinstance(node, dict):
+            out_dict: Dict[str, Any] = {}
+            for k, v in node.items():
+                key_sens = parent_sensitive or self.is_sensitive_column(str(k))
+                masked_v, sub_changed = self._mask_json_node(v, parent_sensitive=key_sens)
+                out_dict[k] = masked_v
+                changed = changed or sub_changed
+            return out_dict, changed
+        if isinstance(node, list):
+            out_list: List[Any] = []
+            for item in node:
+                masked_item, sub_changed = self._mask_json_node(item, parent_sensitive=parent_sensitive)
+                out_list.append(masked_item)
+                changed = changed or sub_changed
+            return out_list, changed
+        if isinstance(node, str):
+            masked_str = self._mask_scalar_string(node, force_sensitive=parent_sensitive, tag="JSON_PII")
+            return masked_str, (masked_str != node)
+        if parent_sensitive and isinstance(node, (int, float)) and not isinstance(node, bool):
+            s = str(node)
+            if len(s) >= 6:
+                return f"[MASKED:JSON_PII len={len(s)}]", True
+        return node, False
+
+    def _mask_scalar_string(self, s: str, force_sensitive: bool, tag: str = "PII") -> str:
+        if s == "":
+            return ""
+        matched_tag = tag if force_sensitive else None
+        if not matched_tag and self.enabled and len(s) <= 128:
+            stripped_check = s.strip()
+            for rx, vtag in VALUE_PII_PATTERNS:
+                if rx.match(stripped_check):
+                    matched_tag = vtag
+                    break
+        if not matched_tag:
+            return s
+        if s.strip() == "":
+            return f"[WHITESPACE_ONLY len={len(s)}]"
+        lead_ws = len(s) - len(s.lstrip())
+        trail_ws = len(s) - len(s.rstrip())
+        core = s.strip()
+        preview = f"{core[0]}***{core[-1]}" if len(core) >= 3 else "***"
+        ws_note = f" lead_ws={lead_ws} trail_ws={trail_ws}" if (lead_ws or trail_ws) else ""
+        return f"{preview} [MASKED:{matched_tag} len={len(s)}{ws_note}]"
 
     def mask_value(self, val: Any, force_sensitive: bool, tag: str = "PII") -> Any:
         if val is None or isinstance(val, (int, float, bool)):
@@ -426,28 +477,23 @@ class DynamicDataMasker:
         if s == "":
             return ""
 
-        matched_tag = tag if force_sensitive else None
-        if not matched_tag and self.enabled and len(s) <= 128:
-            stripped_check = s.strip()
-            for rx, vtag in VALUE_PII_PATTERNS:
-                if rx.match(stripped_check):
-                    matched_tag = vtag
-                    break
+        # Check nested JSON objects/arrays in non-sensitive payload/ext columns
+        if self.enabled and not force_sensitive and len(s) <= 32768:
+            trimmed = s.strip()
+            if (trimmed.startswith("{") and trimmed.endswith("}")) or (
+                trimmed.startswith("[") and trimmed.endswith("]")
+            ):
+                try:
+                    parsed = json.loads(trimmed)
+                    if isinstance(parsed, (dict, list)):
+                        masked_node, changed = self._mask_json_node(parsed, parent_sensitive=False)
+                        if changed:
+                            return json.dumps(masked_node, ensure_ascii=False)
+                        return val
+                except Exception:
+                    pass
 
-        if not matched_tag:
-            return val
-
-        if s.strip() == "":
-            return f"[WHITESPACE_ONLY len={len(s)}]"
-
-        lead_ws = len(s) - len(s.lstrip())
-        trail_ws = len(s) - len(s.rstrip())
-        core = s.strip()
-        preview = f"{core[0]}***{core[-1]}" if len(core) >= 3 else "***"
-        ws_note = ""
-        if lead_ws or trail_ws:
-            ws_note = f" lead_ws={lead_ws} trail_ws={trail_ws}"
-        return f"{preview} [MASKED:{matched_tag} len={len(s)}{ws_note}]"
+        return self._mask_scalar_string(s, force_sensitive=force_sensitive, tag=tag)
 
     def mask_rows(
         self, columns: Sequence[Dict[str, str]], rows: Sequence[Sequence[Any]]
@@ -469,15 +515,73 @@ class DynamicDataMasker:
         return out_rows, masked_cols
 
 
-def sql_literal(val: Any) -> str:
-    """Formats a value safely for generated reverse/rollback SQL scripts."""
+def infer_sql_dialect(jdbc_url: str = "", driver: str = "") -> str:
+    """Infers SQL dialect ('mysql', 'postgres', 'oracle', 'mssql', 'sqlite', 'ansi') from JDBC URL or driver."""
+    low = f"{jdbc_url} {driver}".lower()
+    if any(k in low for k in ("jdbc:mysql:", "jdbc:mariadb:", "jdbc:clickhouse:", "jdbc:oceanbase:", "mode=mariadb", "mode=mysql")):
+        return "mysql"
+    if any(k in low for k in ("jdbc:postgresql:", "jdbc:gaussdb:", "jdbc:kingbase", "postgres", "gauss")):
+        return "postgres"
+    if any(k in low for k in ("jdbc:oracle:", "jdbc:dm:", "oracle", "dameng")):
+        return "oracle"
+    if any(k in low for k in ("jdbc:sqlserver:", "mssql", "sqlserver")):
+        return "mssql"
+    if "jdbc:sqlite:" in low or "sqlite" in low:
+        return "sqlite"
+    return "ansi"
+
+
+def quote_ident(name: str, dialect: str = "mysql") -> str:
+    """Quotes a column or short identifier according to the target SQL dialect."""
+    if dialect == "mysql":
+        return f"`{name.replace('`', '``')}`"
+    if dialect == "mssql":
+        return f"[{name.replace(']', ']]')}]"
+    escaped = name.replace('"', '""')
+    return f'"{escaped}"'
+
+
+def use_database_sql(database: str, dialect: str = "mysql") -> str:
+    if not database or not re.match(r"^[A-Za-z0-9_$-]+$", database):
+        return ""
+    if dialect == "mysql":
+        return f"USE `{database}`;\n"
+    if dialect == "mssql":
+        return f"USE [{database}];\n"
+    if dialect == "postgres":
+        return f'SET search_path TO "{database}";\n'
+    if dialect == "oracle":
+        return f'ALTER SESSION SET CURRENT_SCHEMA = "{database.upper()}";\n'
+    return ""
+
+
+def begin_transaction_header(dialect: str = "mysql") -> List[str]:
+    if dialect == "mysql":
+        return ["SET autocommit = 0;", "START TRANSACTION;"]
+    if dialect == "postgres":
+        return ["BEGIN;"]
+    if dialect == "mssql":
+        return ["BEGIN TRANSACTION;"]
+    if dialect == "sqlite":
+        return ["BEGIN TRANSACTION;"]
+    if dialect == "oracle":
+        return ["-- Oracle starts transaction implicitly on first DML (disable Auto-Commit in client)"]
+    return ["START TRANSACTION;"]
+
+
+def sql_literal(val: Any, dialect: str = "mysql") -> str:
+    """Formats a value safely for generated reverse/rollback SQL scripts across SQL dialects."""
     if val is None:
         return "NULL"
     if isinstance(val, bool):
+        if dialect in {"postgres", "ansi"}:
+            return "TRUE" if val else "FALSE"
         return "1" if val else "0"
     if isinstance(val, (int, float)):
         return str(val)
-    s = str(val).replace("\\", "\\\\").replace("'", "''")
+    s = str(val).replace("'", "''")
+    if dialect == "mysql":
+        s = s.replace("\\", "\\\\")
     return f"'{s}'"
 
 
@@ -486,20 +590,21 @@ def build_insert_backup_sql(
     columns: Sequence[Dict[str, str]],
     rows: Sequence[Sequence[Any]],
     database: str = "",
+    dialect: str = "mysql",
 ) -> str:
     """Generates standalone raw INSERT backup SQL for all pre-modification rows."""
-    use_prefix = f"USE `{database}`;\n" if database and re.match(r"^[A-Za-z0-9_$-]+$", database) else ""
+    use_prefix = use_database_sql(database, dialect)
     if not rows or not columns:
         return f"{use_prefix}-- No pre-existing rows existed prior to modification (e.g. INSERT operation)."
 
     col_names = [c["name"] for c in columns]
-    cols_quoted = ", ".join(f"`{c}`" for c in col_names)
+    cols_quoted = ", ".join(quote_ident(c, dialect) for c in col_names)
     lines = [
-        f"-- Pre-modification full row backup for {table} ({len(rows)} row(s))",
+        f"-- Pre-modification full row backup for {table} ({len(rows)} row(s), dialect={dialect})",
         use_prefix.rstrip("\n") if use_prefix else "-- (default database)",
     ]
     for row in rows:
-        vals_sql = ", ".join(sql_literal(v) for v in row)
+        vals_sql = ", ".join(sql_literal(v, dialect) for v in row)
         lines.append(f"INSERT INTO {table} ({cols_quoted}) VALUES ({vals_sql});")
     return "\n".join(lines)
 
@@ -513,9 +618,10 @@ def build_rollback_sql(
     dml_verb: str = "UPDATE",
     where_clause: str = "",
     database: str = "",
+    dialect: str = "mysql",
 ) -> str:
     """
-    Generates a complete, transaction-wrapped executable reverse/rollback SQL script
+    Generates a complete, dialect-aware, transaction-wrapped executable reverse/rollback SQL script
     for UPDATE, DELETE, or INSERT operations.
     """
     verb = (dml_verb or "UPDATE").upper()
@@ -527,20 +633,19 @@ def build_rollback_sql(
                 pk_list = [candidate]
                 break
 
-    use_stmt = f"USE `{database}`;\n" if database and re.match(r"^[A-Za-z0-9_$-]+$", database) else ""
-    stmts: List[str] = [
-        f"-- Auto-generated executable rollback script for {verb} on {table}",
-        f"{use_stmt}SET autocommit = 0;",
-        "START TRANSACTION;",
-    ]
+    use_stmt = use_database_sql(database, dialect)
+    stmts: List[str] = [f"-- Auto-generated executable rollback script for {verb} on {table} (dialect={dialect})"]
+    if use_stmt:
+        stmts.append(use_stmt.rstrip("\n"))
+    stmts.extend(begin_transaction_header(dialect))
 
     if verb == "DELETE":
         if not before_rows or not col_names:
             stmts.append("-- No deleted rows captured.")
         else:
-            cols_quoted = ", ".join(f"`{c}`" for c in col_names)
+            cols_quoted = ", ".join(quote_ident(c, dialect) for c in col_names)
             for row in before_rows:
-                vals_sql = ", ".join(sql_literal(v) for v in row)
+                vals_sql = ", ".join(sql_literal(v, dialect) for v in row)
                 stmts.append(f"INSERT INTO {table} ({cols_quoted}) VALUES ({vals_sql});")
 
     elif verb == "INSERT":
@@ -549,9 +654,9 @@ def build_rollback_sql(
             for row in target_rows:
                 row_map = dict(zip(col_names, row))
                 where_parts = [
-                    f"`{pk}` = {sql_literal(row_map[pk])}"
+                    f"{quote_ident(pk, dialect)} = {sql_literal(row_map[pk], dialect)}"
                     if row_map[pk] is not None
-                    else f"`{pk}` IS NULL"
+                    else f"{quote_ident(pk, dialect)} IS NULL"
                     for pk in pk_list
                 ]
                 stmts.append(f"DELETE FROM {table} WHERE {' AND '.join(where_parts)};")
@@ -568,16 +673,23 @@ def build_rollback_sql(
                 row_map = dict(zip(col_names, row))
                 if pk_list:
                     set_parts = [
-                        f"`{c}` = {sql_literal(row_map[c])}" for c in col_names if c not in pk_list
+                        f"{quote_ident(c, dialect)} = {sql_literal(row_map[c], dialect)}"
+                        for c in col_names
+                        if c not in pk_list
                     ]
-                    where_parts = [f"`{pk}` = {sql_literal(row_map[pk])}" for pk in pk_list]
+                    where_parts = [
+                        f"{quote_ident(pk, dialect)} = {sql_literal(row_map[pk], dialect)}"
+                        for pk in pk_list
+                    ]
                     if set_parts:
                         stmts.append(
                             f"UPDATE {table} SET {', '.join(set_parts)} WHERE {' AND '.join(where_parts)};"
                         )
                 else:
-                    # Fallback if table has no primary key: match on all columns of after_row if available
-                    set_parts = [f"`{c}` = {sql_literal(row_map[c])}" for c in col_names]
+                    set_parts = [
+                        f"{quote_ident(c, dialect)} = {sql_literal(row_map[c], dialect)}"
+                        for c in col_names
+                    ]
                     cond = where_clause or "1=0"
                     stmts.append(f"UPDATE {table} SET {', '.join(set_parts)} WHERE {cond};")
 
@@ -723,6 +835,7 @@ def build_seed_batch_sql(
     primary_keys: Sequence[str],
     max_seed_rows: int = 50,
     database: str = "",
+    dialect: str = "mysql",
 ) -> Tuple[List[str], str, str, Optional[str]]:
     """
     Constructs parameterized-style safe INSERT statements from structured row dicts,
@@ -746,7 +859,6 @@ def build_seed_batch_sql(
             f"Table '{table}' has no detected primary key; cannot guarantee deterministic 1-click seed cleanup.",
         )
 
-    # Validate consistent column identifiers across all row dicts
     first_cols = list(rows[0].keys())
     if not first_cols:
         return [], "", "", "Row objects cannot be empty."
@@ -768,7 +880,7 @@ def build_seed_batch_sql(
             )
         resolved_pks.append(actual)
 
-    cols_quoted = ", ".join(f"`{c}`" for c in first_cols)
+    cols_quoted = ", ".join(quote_ident(c, dialect) for c in first_cols)
     insert_stmts: List[str] = []
     pk_conditions: List[str] = []
     single_pk_vals: List[str] = []
@@ -780,27 +892,29 @@ def build_seed_batch_sql(
             if r[pk] is None or str(r[pk]).strip() == "":
                 return [], "", "", f"Primary key '{pk}' at row index {idx} cannot be NULL or empty."
 
-        vals_sql = ", ".join(sql_literal(r[c]) for c in first_cols)
+        vals_sql = ", ".join(sql_literal(r[c], dialect) for c in first_cols)
         insert_stmts.append(f"INSERT INTO {table} ({cols_quoted}) VALUES ({vals_sql})")
 
         if len(resolved_pks) == 1:
-            single_pk_vals.append(sql_literal(r[resolved_pks[0]]))
+            single_pk_vals.append(sql_literal(r[resolved_pks[0]], dialect))
         else:
-            and_parts = [f"`{pk}` = {sql_literal(r[pk])}" for pk in resolved_pks]
+            and_parts = [f"{quote_ident(pk, dialect)} = {sql_literal(r[pk], dialect)}" for pk in resolved_pks]
             pk_conditions.append("(" + " AND ".join(and_parts) + ")")
 
     if len(resolved_pks) == 1:
-        where_clause = f"`{resolved_pks[0]}` IN ({', '.join(single_pk_vals)})"
+        where_clause = f"{quote_ident(resolved_pks[0], dialect)} IN ({', '.join(single_pk_vals)})"
     else:
         where_clause = " OR ".join(pk_conditions)
 
     verify_select_sql = f"SELECT * FROM {table} WHERE {where_clause}"
-    use_stmt = f"USE `{database}`;\n" if database and re.match(r"^[A-Za-z0-9_$-]+$", database) else ""
+    use_stmt = use_database_sql(database, dialect)
+    header = [f"-- Auto-generated 1-click cleanup script for {len(rows)} seeded dev test row(s) in {table} (dialect={dialect})"]
+    if use_stmt:
+        header.append(use_stmt.rstrip("\n"))
+    header.extend(begin_transaction_header(dialect))
     cleanup_sql = "\n".join(
         [
-            f"-- Auto-generated 1-click cleanup script for {len(rows)} seeded dev test row(s) in {table}",
-            f"{use_stmt}SET autocommit = 0;",
-            "START TRANSACTION;",
+            *header,
             f"DELETE FROM {table} WHERE {where_clause};",
             "-- Verify 0 test rows remain before committing:",
             f"SELECT COUNT(*) AS remaining_seed_rows FROM {table} WHERE {where_clause};",

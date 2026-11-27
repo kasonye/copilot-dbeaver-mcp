@@ -7,6 +7,7 @@ from copilot_dbeaver_mcp.sql_guard import (
     build_insert_backup_sql,
     build_rollback_sql,
     build_seed_batch_sql,
+    infer_sql_dialect,
     validate_ddl_migration_sql,
     validate_readonly_sql,
     validate_remediation_sql,
@@ -161,6 +162,44 @@ class SqlGuardUnitTests(unittest.TestCase):
             primary_keys=["order_id"],
         )
         self.assertIsNotNone(pk_err)
+
+    def test_multi_dialect_quoting_and_rollback(self) -> None:
+        self.assertEqual(infer_sql_dialect("jdbc:postgresql://localhost:5432/app"), "postgres")
+        self.assertEqual(infer_sql_dialect("jdbc:oracle:thin:@//127.0.0.1:1521/orcl"), "oracle")
+        self.assertEqual(infer_sql_dialect("jdbc:sqlserver://localhost:1433;databaseName=db"), "mssql")
+
+        cols = [{"name": "order_id", "type": "INT"}, {"name": "is_active", "type": "BOOLEAN"}]
+        before = [[77, True]]
+
+        pg_rb = build_rollback_sql(
+            "orders", cols, before, primary_keys=["order_id"], dml_verb="UPDATE", database="public", dialect="postgres"
+        )
+        self.assertIn('SET search_path TO "public";', pg_rb)
+        self.assertIn('UPDATE orders SET "is_active" = TRUE WHERE "order_id" = 77;', pg_rb)
+
+        ms_rb = build_rollback_sql(
+            "orders", cols, before, primary_keys=["order_id"], dml_verb="UPDATE", database="sales", dialect="mssql"
+        )
+        self.assertIn("USE [sales];", ms_rb)
+        self.assertIn("UPDATE orders SET [is_active] = 1 WHERE [order_id] = 77;", ms_rb)
+
+    def test_recursive_json_and_camelcase_pii_masking(self) -> None:
+        masker = DynamicDataMasker(enabled=True)
+        cols = [
+            {"name": "id", "type": "INT"},
+            {"name": "customerName", "type": "VARCHAR"},
+            {"name": "ext_payload", "type": "JSON"},
+        ]
+        payload = '{"channel":"WEB","profile":{"mobilePhone":"13800138000","idCardNo":"A123456(7)","vipLevel":3}}'
+        rows = [[1, "Jane Doe", payload]]
+        masked, masked_cols = masker.mask_rows(cols, rows)
+        self.assertEqual(masked_cols, ["customerName"])
+        self.assertNotIn("Jane Doe", str(masked[0][1]))
+        masked_json = str(masked[0][2])
+        self.assertNotIn("13800138000", masked_json)
+        self.assertNotIn("A123456", masked_json)
+        self.assertIn('"channel": "WEB"', masked_json)
+        self.assertIn('"vipLevel": 3', masked_json)
 
 
 if __name__ == "__main__":

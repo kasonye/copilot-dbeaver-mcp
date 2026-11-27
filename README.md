@@ -7,7 +7,7 @@
 
 **[简体中文文档 (Chinese README)](./README.zh-CN.md)** | **[Security Architecture](./SECURITY.md)**
 
-**Copilot DBeaver MCP** is a zero-password, defense-in-depth **Model Context Protocol (MCP)** server that bridges AI coding assistants (**GitHub Copilot** in IntelliJ IDEA & VS Code, **Cursor**, **Claude Code / Desktop**) with the databases already configured in your local **DBeaver** — across **MariaDB, MySQL, Oracle, PostgreSQL, GaussDB, and H2** on Windows, macOS, and Linux.
+**Copilot DBeaver MCP** is a zero-password, defense-in-depth **Model Context Protocol (MCP)** server that bridges AI coding assistants (**GitHub Copilot** in IntelliJ IDEA & VS Code, **Cursor**, **Claude Code / Desktop**) with the databases already configured in your local **DBeaver** — across **MariaDB, MySQL, Oracle, PostgreSQL, GaussDB, SQL Server, SQLite, ClickHouse, Dameng (DM8), KingbaseES, and H2** on Windows, macOS, and Linux.
 
 It is purpose-built for **both daily feature development and production-grade incident debugging**: generating code against real schemas, validating query plans, seeding & cleaning up local integration test data, safely reviewing schema migrations (DDL), and remediating corrupted records with mandatory backups and audit logs.
 
@@ -52,7 +52,23 @@ flowchart LR
 
 ## Quick Start
 
-### 1. Install
+### Option A: Zero-Install via `uvx` (Once published to PyPI)
+
+Add directly to your IDE's global `mcp.json` — no `git clone` or manual virtualenv needed:
+
+```json
+{
+  "servers": {
+    "copilot-dbeaver-mcp": {
+      "type": "stdio",
+      "command": "uvx",
+      "args": ["copilot-dbeaver-mcp"]
+    }
+  }
+}
+```
+
+### Option B: Install from Source
 
 ```bash
 git clone https://github.com/kasonye/copilot-dbeaver-mcp.git
@@ -91,7 +107,7 @@ Add `copilot-dbeaver-mcp` to your global MCP configuration so it works across **
 
 ---
 
-## Exposed MCP Tools (12 Tools)
+## Exposed MCP Tools (14 Tools)
 
 | Tool | Mode | Description |
 | :--- | :--- | :--- |
@@ -99,13 +115,15 @@ Add `copilot-dbeaver-mcp` to your global MCP configuration so it works across **
 | `list_connections` | Read-Only | Lists all auto-discovered DBeaver connections, drivers, and SSH tunnel status (zero secrets exposed). |
 | `list_databases` | Read-Only | Lists available databases / schemas on a specified DBeaver connection. |
 | `inspect_schema` | Read-Only | Inspects tables, columns, data types, nullability, primary keys, foreign keys, and table DDL. |
+| `diff_schema` | Read-Only | Compares schemas across two environments (e.g. `localhost` vs `staging`), reporting missing tables/columns and generating dialect-aware sync DDL. |
 | `explain_query` | Read-Only | Runs `EXPLAIN` to check index usage before querying large tables. |
-| `diagnose_query` | Read-Only | Runs a single `SELECT / SHOW / DESCRIBE` inside a `READ ONLY` transaction with PII masking. |
+| `diagnose_query` | Read-Only | Runs a single `SELECT / SHOW / DESCRIBE` inside a `READ ONLY` transaction with column & nested-JSON PII masking (backed by an idle-TTL connection pool). |
 | `preview_remediation` | Dry-Run (`ROLLBACK`) | Runs target DML inside a rolled-back transaction, returning before/after diffs and generating a DBeaver `.sql` script. |
 | `open_remediation_in_dbeaver` | Backup + Handoff | Backs up original rows + logs the operation, then opens a manual-transaction `.sql` script (`SET autocommit=0; ... ROLLBACK;`) in DBeaver. |
 | `apply_remediation` | Backup + Atomic Commit | Allowed only on `allow_direct_apply_connections` (default: `localhost`). Persists full backups + audit logs before row-count-locked commit. |
 | `open_ddl_migration_in_dbeaver` | Schema Snapshot + DDL Handoff | Validates `CREATE/ALTER TABLE` & `INDEX` DDL (blocks `DROP TABLE/DATABASE`), snapshots existing DDL, optionally writes a Flyway file, and opens DBeaver with paired reverse DDL. |
-| `seed_dev_test_data` | Local Dev Seed + 1-Click Cleanup | Atomically inserts structured test rows on allowed dev connections (with PK collision pre-check) and generates a consolidated `DELETE ... WHERE pk IN (...)` cleanup backup. |
+| `seed_dev_test_data` | Local Dev Seed + 1-Click Cleanup | Atomically inserts structured test rows on allowed dev connections (with PK collision pre-check) and generates a dialect-aware `DELETE ... WHERE pk IN (...)` cleanup backup. |
+| `rollback_by_change_id` | Atomic Rollback / Handoff | One-click rollback or test-seed cleanup by `change_id` (executes atomically on allowed dev DBs, or opens `rollback.sql` in DBeaver on remote DBs). |
 | `list_modification_history` | Read-Only | Queries chronological modification audit logs, field diffs, backup bundles, and `rollback.sql` paths. |
 
 ---

@@ -170,6 +170,12 @@ public class JdbcBridge {
                 "oracle.jdbc.OracleDriver",
                 "org.postgresql.Driver",
                 "com.huawei.gauss200.jdbc.Driver",
+                "com.microsoft.sqlserver.jdbc.SQLServerDriver",
+                "org.sqlite.JDBC",
+                "com.clickhouse.jdbc.ClickHouseDriver",
+                "dm.jdbc.driver.DmDriver",
+                "com.kingbase8.Driver",
+                "com.oceanbase.jdbc.Driver",
                 "org.h2.Driver"
             };
             for (String cls : knownClasses) {
@@ -188,6 +194,8 @@ public class JdbcBridge {
             }
         }
 
+        startIdlePoolReaper();
+
         BufferedReader reader = new BufferedReader(new InputStreamReader(System.in, StandardCharsets.UTF_8));
         String line;
         while ((line = reader.readLine()) != null) {
@@ -204,6 +212,10 @@ public class JdbcBridge {
     }
 
     private static void closeAllTunnels() {
+        for (IdleConn ic : CONN_POOL.values()) {
+            ic.closePhysical();
+        }
+        CONN_POOL.clear();
         for (ActiveSshTunnel t : SSH_TUNNELS.values()) {
             t.closeQuietly();
         }
@@ -238,13 +250,121 @@ public class JdbcBridge {
         return new String(Base64.getDecoder().decode(s), StandardCharsets.UTF_8);
     }
 
-    // -------------------- DBeaver Credentials & SSH Tunnel --------------------
+    // -------------------- Credential Cache & Idle-TTL Connection Pool --------------------
+
+    private static final long IDLE_TTL_MS = 180_000L; // 3 minutes idle auto-eviction
+    private static final Map<String, CredCacheEntry> CRED_CACHE = new ConcurrentHashMap<>();
+    private static final Map<String, IdleConn> CONN_POOL = new ConcurrentHashMap<>();
+
+    private record CredCacheEntry(long mtime, long size, Map<String, Object> parsed) {}
+
+    private static final class IdleConn {
+        final Connection conn;
+        volatile long lastReturnedAtMs;
+
+        IdleConn(Connection conn) {
+            this.conn = conn;
+            this.lastReturnedAtMs = System.currentTimeMillis();
+        }
+
+        void closePhysical() {
+            try {
+                conn.close();
+            } catch (Throwable ignored) {
+            }
+        }
+    }
+
+    private static final class PooledConn implements AutoCloseable {
+        final String poolKey;
+        final Connection conn;
+        boolean broken = false;
+
+        PooledConn(String poolKey, Connection conn) {
+            this.poolKey = poolKey;
+            this.conn = conn;
+        }
+
+        void markBroken() {
+            this.broken = true;
+        }
+
+        @Override
+        public void close() {
+            try {
+                if (!conn.isClosed()) {
+                    try {
+                        conn.rollback();
+                    } catch (SQLException ignored) {
+                    }
+                    try {
+                        conn.setReadOnly(false);
+                    } catch (SQLException ignored) {
+                    }
+                }
+            } catch (SQLException e) {
+                broken = true;
+            }
+            if (broken || poolKey == null) {
+                try {
+                    conn.close();
+                } catch (Throwable ignored) {
+                }
+                return;
+            }
+            try {
+                if (conn.isClosed()) {
+                    return;
+                }
+            } catch (SQLException e) {
+                try {
+                    conn.close();
+                } catch (Throwable ignored) {
+                }
+                return;
+            }
+            IdleConn prev = CONN_POOL.put(poolKey, new IdleConn(conn));
+            if (prev != null && prev.conn != conn) {
+                prev.closePhysical();
+            }
+        }
+    }
+
+    private static void startIdlePoolReaper() {
+        Thread reaper = new Thread(() -> {
+            while (true) {
+                try {
+                    Thread.sleep(30_000L);
+                    long now = System.currentTimeMillis();
+                    for (Map.Entry<String, IdleConn> entry : CONN_POOL.entrySet()) {
+                        IdleConn ic = entry.getValue();
+                        if (now - ic.lastReturnedAtMs > IDLE_TTL_MS) {
+                            if (CONN_POOL.remove(entry.getKey(), ic)) {
+                                ic.closePhysical();
+                            }
+                        }
+                    }
+                } catch (InterruptedException ie) {
+                    break;
+                } catch (Throwable ignored) {
+                }
+            }
+        }, "copilot-dbeaver-pool-reaper");
+        reaper.setDaemon(true);
+        reaper.start();
+    }
 
     @SuppressWarnings("unchecked")
     private static Map<String, Object> decryptDbeaverCredentials(String credFilePath) throws Exception {
         File f = new File(credFilePath);
         if (!f.isFile()) {
             return Map.of();
+        }
+        long mtime = f.lastModified();
+        long size = f.length();
+        CredCacheEntry cached = CRED_CACHE.get(credFilePath);
+        if (cached != null && cached.mtime() == mtime && cached.size() == size) {
+            return cached.parsed();
         }
         byte[] raw = Files.readAllBytes(f.toPath());
         if (raw.length <= 16) {
@@ -261,7 +381,9 @@ public class JdbcBridge {
         String jsonText = new String(plain, StandardCharsets.UTF_8).trim();
         Object parsed = new MiniJsonParser(jsonText).parseValue();
         if (parsed instanceof Map<?, ?> m) {
-            return (Map<String, Object>) m;
+            Map<String, Object> map = (Map<String, Object>) m;
+            CRED_CACHE.put(credFilePath, new CredCacheEntry(mtime, size, map));
+            return map;
         }
         return Map.of();
     }
@@ -375,7 +497,7 @@ public class JdbcBridge {
     }
 
     @SuppressWarnings("unchecked")
-    private static Connection openResolvedConnection(
+    private static PooledConn openResolvedConnection(
             String rawJdbcUrl,
             String userSpec,
             String passSpec,
@@ -445,9 +567,28 @@ public class JdbcBridge {
             props.setProperty("password", resolvedPass);
         }
 
+        // Don't pool URLs carrying one-shot H2 INIT=... scripts
+        boolean cacheable = !safeUrl.toUpperCase().contains(";INIT=");
+        String poolKey = cacheable ? (safeUrl + "|" + resolvedUser + "|" + (targetDb != null ? targetDb : "")) : null;
+        if (poolKey != null) {
+            IdleConn idle = CONN_POOL.remove(poolKey);
+            if (idle != null) {
+                try {
+                    if (!idle.conn.isClosed() && idle.conn.isValid(2)) {
+                        idle.conn.setAutoCommit(false);
+                        applyTargetDatabase(idle.conn, safeUrl, targetDb);
+                        return new PooledConn(poolKey, idle.conn);
+                    }
+                } catch (Throwable ignored) {
+                }
+                idle.closePhysical();
+            }
+        }
+
         Connection conn = DriverManager.getConnection(safeUrl, props);
+        conn.setAutoCommit(false);
         applyTargetDatabase(conn, safeUrl, targetDb);
-        return conn;
+        return new PooledConn(poolKey, conn);
     }
 
     private static void applyTargetDatabase(Connection conn, String jdbcUrl, String targetDb) throws SQLException {
@@ -458,13 +599,13 @@ public class JdbcBridge {
             throw new SQLException("Invalid database/schema identifier: " + targetDb);
         }
         String lower = jdbcUrl.toLowerCase();
-        if (lower.startsWith("jdbc:mysql:") || lower.startsWith("jdbc:mariadb:")) {
+        if (lower.startsWith("jdbc:mysql:") || lower.startsWith("jdbc:mariadb:") || lower.startsWith("jdbc:sqlserver:")) {
             conn.setCatalog(targetDb);
-        } else if (lower.startsWith("jdbc:oracle:")) {
+        } else if (lower.startsWith("jdbc:oracle:") || lower.startsWith("jdbc:dm:")) {
             try (Statement st = conn.createStatement()) {
                 st.execute("ALTER SESSION SET CURRENT_SCHEMA = \"" + targetDb.toUpperCase() + "\"");
             }
-        } else if (lower.startsWith("jdbc:h2:")) {
+        } else if (lower.startsWith("jdbc:h2:") || lower.startsWith("jdbc:kingbase8:")) {
             try {
                 conn.setSchema(targetDb);
             } catch (SQLException ignored) {
@@ -482,14 +623,20 @@ public class JdbcBridge {
         } catch (SQLException ignored) {
         }
         String lower = jdbcUrl.toLowerCase();
-        if (lower.startsWith("jdbc:mysql:") || lower.startsWith("jdbc:mariadb:") || lower.startsWith("jdbc:postgresql:")) {
+        if (lower.startsWith("jdbc:mysql:") || lower.startsWith("jdbc:mariadb:")
+                || lower.startsWith("jdbc:postgresql:") || lower.startsWith("jdbc:kingbase8:")) {
             try (Statement st = conn.createStatement()) {
                 st.execute("SET SESSION TRANSACTION READ ONLY");
             } catch (SQLException ignored) {
             }
-        } else if (lower.startsWith("jdbc:oracle:")) {
+        } else if (lower.startsWith("jdbc:oracle:") || lower.startsWith("jdbc:dm:")) {
             try (Statement st = conn.createStatement()) {
                 st.execute("SET TRANSACTION READ ONLY");
+            } catch (SQLException ignored) {
+            }
+        } else if (lower.startsWith("jdbc:sqlite:")) {
+            try (Statement st = conn.createStatement()) {
+                st.execute("PRAGMA query_only = ON");
             } catch (SQLException ignored) {
             }
         }
@@ -521,11 +668,14 @@ public class JdbcBridge {
                 case "PING" -> emitPing(reqId);
                 case "LIST_DBS" -> handleListDbs(reqId, jdbcUrl, user, pass, targetDb, extraProps, timeoutSec);
                 case "SCHEMA" -> handleSchema(reqId, jdbcUrl, user, pass, targetDb, extraProps, timeoutSec, maxRows, arg1, arg2);
+                case "BULK_SCHEMA" -> handleBulkSchema(reqId, jdbcUrl, user, pass, targetDb, extraProps, timeoutSec, maxRows, arg1, arg2);
                 case "QUERY" -> handleQuery(reqId, jdbcUrl, user, pass, targetDb, extraProps, timeoutSec, maxRows, arg1);
                 case "REMEDIATE" -> handleRemediate(
                         reqId, jdbcUrl, user, pass, targetDb, extraProps, timeoutSec, maxRows, dryRun, expectedRows, arg1, arg2);
                 case "SEED" -> handleSeed(
                         reqId, jdbcUrl, user, pass, targetDb, extraProps, timeoutSec, maxRows, dryRun, arg1, arg2);
+                case "EXEC_BATCH" -> handleExecBatch(
+                        reqId, jdbcUrl, user, pass, targetDb, extraProps, timeoutSec, dryRun, arg1);
                 default -> emitError(reqId, "Unsupported mode: " + mode, null, -1);
             }
         } catch (SQLException sqle) {
@@ -558,7 +708,8 @@ public class JdbcBridge {
     private static void handleListDbs(
             String reqId, String jdbcUrl, String user, String pass,
             String targetDb, String extraProps, int timeoutSec) throws Exception {
-        try (Connection conn = openResolvedConnection(jdbcUrl, user, pass, targetDb, extraProps, timeoutSec)) {
+        try (PooledConn pc = openResolvedConnection(jdbcUrl, user, pass, targetDb, extraProps, timeoutSec)) {
+            Connection conn = pc.conn;
             conn.setAutoCommit(false);
             enforceSessionReadOnly(conn, jdbcUrl);
             try {
@@ -603,7 +754,8 @@ public class JdbcBridge {
     private static void handleSchema(
             String reqId, String jdbcUrl, String user, String pass, String targetDb, String extraProps,
             int timeoutSec, int maxRows, String schemaFilter, String tableTarget) throws Exception {
-        try (Connection conn = openResolvedConnection(jdbcUrl, user, pass, targetDb, extraProps, timeoutSec)) {
+        try (PooledConn pc = openResolvedConnection(jdbcUrl, user, pass, targetDb, extraProps, timeoutSec)) {
+            Connection conn = pc.conn;
             conn.setAutoCommit(false);
             enforceSessionReadOnly(conn, jdbcUrl);
             try {
@@ -742,7 +894,8 @@ public class JdbcBridge {
             String reqId, String jdbcUrl, String user, String pass, String targetDb, String extraProps,
             int timeoutSec, int maxRows, String sql) throws Exception {
         int cap = Math.max(1, Math.min(maxRows, 500));
-        try (Connection conn = openResolvedConnection(jdbcUrl, user, pass, targetDb, extraProps, timeoutSec)) {
+        try (PooledConn pc = openResolvedConnection(jdbcUrl, user, pass, targetDb, extraProps, timeoutSec)) {
+            Connection conn = pc.conn;
             conn.setAutoCommit(false);
             enforceSessionReadOnly(conn, jdbcUrl);
             try (Statement st = conn.createStatement()) {
@@ -777,7 +930,8 @@ public class JdbcBridge {
             int timeoutSec, int maxWriteRows, boolean dryRun, int expectedRows,
             String selectSql, String dmlSql) throws Exception {
         int safeCap = Math.max(1, Math.min(maxWriteRows, 100));
-        try (Connection conn = openResolvedConnection(jdbcUrl, user, pass, targetDb, extraProps, timeoutSec)) {
+        try (PooledConn pc = openResolvedConnection(jdbcUrl, user, pass, targetDb, extraProps, timeoutSec)) {
+            Connection conn = pc.conn;
             conn.setAutoCommit(false);
             try {
                 conn.setReadOnly(false);
@@ -857,6 +1011,149 @@ public class JdbcBridge {
         }
     }
 
+    private static void handleBulkSchema(
+            String reqId, String jdbcUrl, String user, String pass, String targetDb, String extraProps,
+            int timeoutSec, int maxTables, String schemaFilter, String tablePattern) throws Exception {
+        int cap = Math.max(1, Math.min(maxTables, 500));
+        try (PooledConn pc = openResolvedConnection(jdbcUrl, user, pass, targetDb, extraProps, timeoutSec)) {
+            Connection conn = pc.conn;
+            conn.setAutoCommit(false);
+            enforceSessionReadOnly(conn, jdbcUrl);
+            try {
+                DatabaseMetaData meta = conn.getMetaData();
+                String effectiveFilter = (schemaFilter != null && !schemaFilter.isEmpty())
+                        ? schemaFilter
+                        : (targetDb != null && !targetDb.isEmpty() ? targetDb : conn.getCatalog());
+                String catalog = (effectiveFilter != null && !effectiveFilter.isEmpty()) ? effectiveFilter : null;
+                String schemaPat = null;
+                if ((jdbcUrl.toLowerCase().startsWith("jdbc:oracle:") || jdbcUrl.toLowerCase().startsWith("jdbc:dm:"))
+                        && effectiveFilter != null) {
+                    catalog = null;
+                    schemaPat = effectiveFilter.toUpperCase();
+                }
+                String pat = (tablePattern == null || tablePattern.isEmpty()) ? "%" : tablePattern;
+
+                Map<String, List<Map<String, Object>>> tableCols = new LinkedHashMap<>();
+                try (ResultSet rs = meta.getTables(catalog, schemaPat, pat, new String[] {"TABLE"})) {
+                    while (rs.next() && tableCols.size() < cap) {
+                        tableCols.put(rs.getString("TABLE_NAME"), new ArrayList<>());
+                    }
+                }
+
+                // Single JDBC metadata sweep for all columns across matching tables!
+                try (ResultSet rs = meta.getColumns(catalog, schemaPat, pat, "%")) {
+                    while (rs.next()) {
+                        String tName = rs.getString("TABLE_NAME");
+                        List<Map<String, Object>> cols = tableCols.get(tName);
+                        if (cols != null) {
+                            Map<String, Object> c = new LinkedHashMap<>();
+                            c.put("name", rs.getString("COLUMN_NAME"));
+                            c.put("type", rs.getString("TYPE_NAME"));
+                            c.put("size", rs.getInt("COLUMN_SIZE"));
+                            c.put("nullable", rs.getInt("NULLABLE") != DatabaseMetaData.columnNoNulls);
+                            c.put("defaultValue", rs.getString("COLUMN_DEF"));
+                            cols.add(c);
+                        }
+                    }
+                }
+
+                StringBuilder sb = new StringBuilder();
+                sb.append("{\"id\":").append(jsonStr(reqId))
+                  .append(",\"ok\":true,\"productName\":").append(jsonStr(meta.getDatabaseProductName()))
+                  .append(",\"activeDatabase\":").append(jsonStr(conn.getCatalog()))
+                  .append(",\"tables\":{");
+                int tIdx = 0;
+                for (Map.Entry<String, List<Map<String, Object>>> entry : tableCols.entrySet()) {
+                    if (tIdx++ > 0) sb.append(',');
+                    String tName = entry.getKey();
+                    List<String> pks = new ArrayList<>();
+                    try (ResultSet pkRs = meta.getPrimaryKeys(catalog, schemaPat, tName)) {
+                        while (pkRs.next()) {
+                            pks.add(pkRs.getString("COLUMN_NAME"));
+                        }
+                    } catch (SQLException ignored) {
+                    }
+                    sb.append(jsonStr(tName)).append(":{\"primaryKeys\":[");
+                    for (int i = 0; i < pks.size(); i++) {
+                        if (i > 0) sb.append(',');
+                        sb.append(jsonStr(pks.get(i)));
+                    }
+                    sb.append("],\"columns\":[");
+                    List<Map<String, Object>> cols = entry.getValue();
+                    for (int i = 0; i < cols.size(); i++) {
+                        if (i > 0) sb.append(',');
+                        Map<String, Object> c = cols.get(i);
+                        sb.append("{\"name\":").append(jsonStr((String) c.get("name")))
+                          .append(",\"type\":").append(jsonStr((String) c.get("type")))
+                          .append(",\"size\":").append(c.get("size"))
+                          .append(",\"nullable\":").append(c.get("nullable"))
+                          .append(",\"defaultValue\":").append(jsonStr((String) c.get("defaultValue")))
+                          .append('}');
+                    }
+                    sb.append("]}");
+                }
+                sb.append("}}");
+                emitLine(sb.toString());
+            } finally {
+                try {
+                    conn.rollback();
+                } catch (SQLException ignored) {
+                }
+            }
+        }
+    }
+
+    private static void handleExecBatch(
+            String reqId, String jdbcUrl, String user, String pass, String targetDb, String extraProps,
+            int timeoutSec, boolean dryRun, String statementsJson) throws Exception {
+        Object parsed = new MiniJsonParser(statementsJson).parseValue();
+        if (!(parsed instanceof List<?> stmtList) || stmtList.isEmpty()) {
+            emitError(reqId, "EXEC_BATCH requires a non-empty JSON array of DML statements.", "45000", -1);
+            return;
+        }
+        try (PooledConn pc = openResolvedConnection(jdbcUrl, user, pass, targetDb, extraProps, timeoutSec)) {
+            Connection conn = pc.conn;
+            conn.setAutoCommit(false);
+            try {
+                conn.setReadOnly(false);
+            } catch (SQLException ignored) {
+            }
+            boolean committed = false;
+            try (Statement st = conn.createStatement()) {
+                st.setQueryTimeout(Math.max(1, timeoutSec));
+                int totalAffected = 0;
+                for (Object item : stmtList) {
+                    totalAffected += st.executeUpdate(strOrEmpty(item));
+                }
+                if (dryRun) {
+                    conn.rollback();
+                } else {
+                    conn.commit();
+                    committed = true;
+                }
+                emitLine("{\"id\":" + jsonStr(reqId)
+                        + ",\"ok\":true,\"dryRun\":" + dryRun
+                        + ",\"committed\":" + committed
+                        + ",\"statementCount\":" + stmtList.size()
+                        + ",\"affectedRows\":" + totalAffected + "}");
+            } catch (SQLException e) {
+                pc.markBroken();
+                try {
+                    conn.rollback();
+                } catch (SQLException ignored) {
+                }
+                throw e;
+            } finally {
+                if (!committed) {
+                    try {
+                        conn.rollback();
+                    } catch (SQLException ignored) {
+                    }
+                }
+            }
+        }
+    }
+
     private static void handleSeed(
             String reqId, String jdbcUrl, String user, String pass, String targetDb, String extraProps,
             int timeoutSec, int maxSeedRows, boolean dryRun, String checkAndVerifySelectSql, String batchInsertsJson)
@@ -872,7 +1169,8 @@ public class JdbcBridge {
             return;
         }
 
-        try (Connection conn = openResolvedConnection(jdbcUrl, user, pass, targetDb, extraProps, timeoutSec)) {
+        try (PooledConn pc = openResolvedConnection(jdbcUrl, user, pass, targetDb, extraProps, timeoutSec)) {
+            Connection conn = pc.conn;
             conn.setAutoCommit(false);
             try {
                 conn.setReadOnly(false);

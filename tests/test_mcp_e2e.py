@@ -95,6 +95,8 @@ class McpEndToEndTests(unittest.TestCase):
     def test_full_mcp_lifecycle_with_dbeaver_vault_and_mandatory_backups(self) -> None:
         h2_db_path = (self.tmp_dir / "sample_app").as_posix()
         jdbc_url = f"jdbc:h2:file:{h2_db_path};MODE=MariaDB;DATABASE_TO_LOWER=TRUE"
+        h2_old_path = (self.tmp_dir / "legacy_staging").as_posix()
+        legacy_jdbc_url = f"jdbc:h2:file:{h2_old_path};MODE=MariaDB;DATABASE_TO_LOWER=TRUE"
 
         bridge = JdbcBridgeProcess(self.drivers, compile_dir=self.tmp_dir / "bin")
         bridge.ensure_compiled()
@@ -106,11 +108,24 @@ class McpEndToEndTests(unittest.TestCase):
             "customer_name VARCHAR(64), "
             "national_id VARCHAR(32)"
             ")\\;"
+            "CREATE TABLE IF NOT EXISTS order_audit_events ("
+            "event_id INT PRIMARY KEY, "
+            "event_type VARCHAR(32) NOT NULL"
+            ")\\;"
             "DELETE FROM customer_orders\\;"
             "INSERT INTO customer_orders VALUES "
             "(101, 'ORD-2026-001', 'PAID', 'Jane Doe', 'A123456(7)'), "
             "(102, 'ORD-2026-002', 'CORRUPTED_ENUM_99', 'John Smith  ', 'B987654(3)'), "
             "(103, 'ORD-2026-003', 'ORPHAN_DUPLICATE', 'Bob Martin', 'C112233(4)');"
+        )
+        # Legacy staging DB lacks 'national_id' column and lacks 'order_audit_events' table
+        legacy_init_sql = (
+            "CREATE TABLE IF NOT EXISTS customer_orders ("
+            "order_id INT PRIMARY KEY, "
+            "order_code VARCHAR(32) NOT NULL, "
+            "order_status VARCHAR(32) NOT NULL, "
+            "customer_name VARCHAR(64)"
+            ");"
         )
         seed = bridge.request(
             mode="QUERY",
@@ -119,8 +134,16 @@ class McpEndToEndTests(unittest.TestCase):
             pass_spec="VaultPass#2026",
             arg1="SELECT COUNT(*) FROM customer_orders",
         )
+        seed_legacy = bridge.request(
+            mode="QUERY",
+            jdbc_url=f"{legacy_jdbc_url};INIT={legacy_init_sql}",
+            user_spec="vault_admin",
+            pass_spec="VaultPass#2026",
+            arg1="SELECT COUNT(*) FROM customer_orders",
+        )
         bridge.close()
         self.assertTrue(seed.get("ok"), f"Failed to seed H2 test DB: {seed}")
+        self.assertTrue(seed_legacy.get("ok"), f"Failed to seed legacy H2 DB: {seed_legacy}")
 
         # Prepare mock cross-platform DBeaver workspace with AES-encrypted credentials
         dbv_dir = self.tmp_dir / "workspace6" / "General" / ".dbeaver"
@@ -146,6 +169,13 @@ class McpEndToEndTests(unittest.TestCase):
                             "save-password": True,
                             "configuration": {"host": "10.0.1.50", "port": "3306", "url": jdbc_url, "type": "dev"},
                         },
+                        "legacy-staging-schema-h2": {
+                            "provider": "h2",
+                            "driver": "h2_embedded",
+                            "name": "legacy-schema-db",
+                            "save-password": True,
+                            "configuration": {"host": "10.0.1.51", "port": "3306", "url": legacy_jdbc_url, "type": "dev"},
+                        },
                     }
                 }
             ),
@@ -158,6 +188,7 @@ class McpEndToEndTests(unittest.TestCase):
                 {
                     "local-dev-h2": {"#connection": {"user": "vault_admin", "password": "VaultPass#2026"}},
                     "remote-staging-h2": {"#connection": {"user": "vault_admin", "password": "VaultPass#2026"}},
+                    "legacy-staging-schema-h2": {"#connection": {"user": "vault_admin", "password": "VaultPass#2026"}},
                 }
             ),
         )
@@ -207,7 +238,7 @@ dbeaver:
             self.assertEqual(init_resp["result"]["serverInfo"]["name"], "copilot-dbeaver-mcp")
 
             tools_resp = send_rpc(proc, {"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
-            self.assertEqual(len(tools_resp["result"]["tools"]), 12)
+            self.assertEqual(len(tools_resp["result"]["tools"]), 14)
 
             # 1. Read-only query + PII masking on staging-db
             is_err, diag = call_tool(
@@ -418,21 +449,17 @@ dbeaver:
             self.assertEqual(seeded["inserted_rows"], 2)
             self.assertNotIn("Test User One", json.dumps(seeded["seeded_rows"]))
 
-            # Execute 1-click batch cleanup using the returned one_click_cleanup_dml!
+            # Execute 1-click batch cleanup via rollback_by_change_id!
             is_err, cleaned_up = call_tool(
                 proc,
                 15,
-                "apply_remediation",
-                {
-                    "connection": "localhost",
-                    "issue_summary": "Clean up seeded integration test rows",
-                    "table": "customer_orders",
-                    "where_clause": seeded["cleanup_where_clause"],
-                    "dml_sql": seeded["one_click_cleanup_dml"],
-                    "expected_affected_rows": 2,
-                },
+                "rollback_by_change_id",
+                {"change_id": seeded["change_id"]},
             )
             self.assertFalse(is_err, cleaned_up)
+            self.assertTrue(cleaned_up["committed_directly"])
+            self.assertEqual(cleaned_up["restored_or_cleaned_rows"], 2)
+
             _, verify_zero_seed = call_tool(
                 proc,
                 16,
@@ -441,8 +468,24 @@ dbeaver:
             )
             self.assertEqual(verify_zero_seed["rows"][0][0], 0)
 
-            # 7. Verify audit ledger masks PII while tracking all 7 operations
-            is_err, hist = call_tool(proc, 17, "list_modification_history", {"limit": 20})
+            # 7. Test diff_schema between localhost and legacy-schema-db
+            is_err, sdiff = call_tool(
+                proc,
+                17,
+                "diff_schema",
+                {
+                    "source_connection": "localhost",
+                    "target_connection": "legacy-schema-db",
+                },
+            )
+            self.assertFalse(is_err, sdiff)
+            self.assertFalse(sdiff["identical"])
+            self.assertIn("order_audit_events", [t.lower() for t in sdiff["missing_tables_in_target"]])
+            self.assertTrue(any("ADD COLUMN" in d for d in sdiff["suggested_sync_ddl"]))
+            self.assertTrue(any("CREATE TABLE" in d for d in sdiff["suggested_sync_ddl"]))
+
+            # 8. Verify audit ledger masks PII while tracking all 7 operations
+            is_err, hist = call_tool(proc, 18, "list_modification_history", {"limit": 20})
             self.assertFalse(is_err, hist)
             self.assertEqual(hist["total_entries"], 7)
             md_ledger = Path(hist["audit_markdown_path"]).read_text(encoding="utf-8")

@@ -81,6 +81,7 @@ class ModificationAuditor:
         before_rows_unmasked: Sequence[Sequence[Any]],
         after_rows_unmasked: Sequence[Sequence[Any]],
         expected_affected_rows: int,
+        dialect: str = "mysql",
     ) -> Dict[str, str]:
         """
         Persists full unmasked data backup + executable rollback SQL to disk and verifies
@@ -105,6 +106,7 @@ class ModificationAuditor:
             columns=columns,
             rows=before_rows_unmasked,
             database=database,
+            dialect=dialect,
         )
         rollback_sql = build_rollback_sql(
             table=table,
@@ -115,6 +117,7 @@ class ModificationAuditor:
             dml_verb=dml_verb,
             where_clause=where_clause,
             database=database,
+            dialect=dialect,
         )
 
         record_payload = {
@@ -286,6 +289,19 @@ class ModificationAuditor:
             "total_entries": len(parsed),
             "entries": recent,
         }
+
+    def find_entry_by_change_id(self, change_id: str) -> Optional[Dict[str, Any]]:
+        if not self.jsonl_log_path.is_file():
+            return None
+        target = (change_id or "").strip()
+        lines = self.jsonl_log_path.read_text(encoding="utf-8").splitlines()
+        for line in reversed(lines):
+            if not line.strip():
+                continue
+            entry = json.loads(line)
+            if str(entry.get("change_id")) == target:
+                return entry
+        return None
 
     def record_ddl_migration_backup_and_log(
         self,

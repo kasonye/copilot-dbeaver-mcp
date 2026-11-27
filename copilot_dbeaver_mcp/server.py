@@ -29,10 +29,14 @@ from copilot_dbeaver_mcp.dbeaver_bridge import (
     write_dbeaver_ddl_migration_script,
     write_dbeaver_remediation_script,
 )
+from copilot_dbeaver_mcp.schema_diff import compute_schema_diff
 from copilot_dbeaver_mcp.sql_guard import (
     DynamicDataMasker,
     build_rollback_sql,
     build_seed_batch_sql,
+    infer_sql_dialect,
+    split_sql_statements_safe,
+    strip_comments_and_literals,
     validate_ddl_migration_sql,
     validate_identifier,
     validate_readonly_sql,
@@ -52,8 +56,9 @@ def _b64(text: Optional[str]) -> str:
 
 
 def _extract_dml_verb(dml_sql: str) -> str:
-    m = re.match(r"^\s*([A-Za-z]+)", dml_sql or "")
-    return m.group(1).upper() if m else "UPDATE"
+    norm, _ = strip_comments_and_literals(dml_sql or "")
+    m = re.match(r"^\s*([A-Za-z]+)", norm)
+    return m.group(1).upper() if m else ""
 
 
 def discover_default_driver_paths(
@@ -65,6 +70,8 @@ def discover_default_driver_paths(
         str(m2_repo / "org" / "mariadb" / "jdbc" / "mariadb-java-client"),
         str(m2_repo / "com" / "mysql" / "mysql-connector-j"),
         str(m2_repo / "org" / "postgresql" / "postgresql"),
+        str(m2_repo / "com" / "microsoft" / "sqlserver" / "mssql-jdbc"),
+        str(m2_repo / "org" / "xerial" / "sqlite-jdbc"),
         str(m2_repo / "com" / "h2database" / "h2"),
         *find_dbeaver_sshj_jars(dbeaver_exe),
     ]
@@ -651,6 +658,7 @@ class DbGuardApp:
         before_raw = res.get("beforeRows", [])
         after_raw = res.get("afterRows", [])
         affected = res.get("affectedRows", 0)
+        dialect = infer_sql_dialect(tgt.jdbc_url)
         rollback_sql = build_rollback_sql(
             table=table,
             columns=columns,
@@ -660,6 +668,7 @@ class DbGuardApp:
             dml_verb=dml_verb,
             where_clause=clean_where,
             database=tgt.target_db,
+            dialect=dialect,
         )
         masked_before, masked_cols = self.masker.mask_rows(columns, before_raw)
         masked_after, _ = self.masker.mask_rows(columns, after_raw)
@@ -807,6 +816,7 @@ class DbGuardApp:
             before_rows_unmasked=before_unmasked,
             after_rows_unmasked=after_unmasked,
             expected_affected_rows=affected,
+            dialect=infer_sql_dialect(tgt.jdbc_url),
         )
 
         script_path = write_dbeaver_remediation_script(
@@ -945,6 +955,7 @@ class DbGuardApp:
             before_rows_unmasked=before_unmasked,
             after_rows_unmasked=after_preview_unmasked,
             expected_affected_rows=expected_rows,
+            dialect=infer_sql_dialect(tgt.jdbc_url),
         )
 
         commit_res = self.jdbc.request(
@@ -1195,12 +1206,14 @@ class DbGuardApp:
         dry_run = bool(args.get("dry_run", False))
 
         pks = self._fetch_primary_keys(tgt, table)
+        dialect = infer_sql_dialect(tgt.jdbc_url)
         insert_stmts, verify_select_sql, cleanup_sql, build_err = build_seed_batch_sql(
             table=table,
             rows=rows,
             primary_keys=pks,
             max_seed_rows=self.max_seed_rows,
             database=tgt.target_db,
+            dialect=dialect,
         )
         if build_err:
             raise ValueError(f"Seed Validation Error: {build_err}")
@@ -1294,6 +1307,203 @@ class DbGuardApp:
             max_matches=min(int(args.get("max_matches", 15)), 50),
             tail_lines=min(int(args.get("tail_lines", 8000)), 50000),
         )
+
+    def tool_diff_schema(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Compares schema metadata between source_connection/source_database (e.g. localhost dev)
+        and target_connection/target_database (e.g. staging / SIT / UAT), generating exact
+        missing table/column diffs and dialect-aware incremental sync DDL.
+        """
+        self.reload_config()
+        src_tgt = self._resolve_target(args.get("source_connection"), args.get("source_database"))
+        dst_tgt = self._resolve_target(args.get("target_connection"), args.get("target_database"))
+        table_pattern = (args.get("table") or args.get("table_pattern") or "%").strip()
+        max_tables = min(int(args.get("max_tables", 200)), 500)
+
+        src_res = self.jdbc.request(
+            mode="BULK_SCHEMA",
+            jdbc_url=src_tgt.jdbc_url,
+            user_spec=src_tgt.user_spec,
+            pass_spec=src_tgt.pass_spec,
+            target_db=src_tgt.target_db,
+            props_text=src_tgt.props_text,
+            timeout_sec=self.query_timeout_sec,
+            max_rows=max_tables,
+            arg1=src_tgt.target_db,
+            arg2=table_pattern,
+        )
+        if not src_res.get("ok"):
+            raise RuntimeError(f"Failed to read source schema on '{src_tgt.display_name}': {src_res.get('error')}")
+
+        dst_res = self.jdbc.request(
+            mode="BULK_SCHEMA",
+            jdbc_url=dst_tgt.jdbc_url,
+            user_spec=dst_tgt.user_spec,
+            pass_spec=dst_tgt.pass_spec,
+            target_db=dst_tgt.target_db,
+            props_text=dst_tgt.props_text,
+            timeout_sec=self.query_timeout_sec,
+            max_rows=max_tables,
+            arg1=dst_tgt.target_db,
+            arg2=table_pattern,
+        )
+        if not dst_res.get("ok"):
+            raise RuntimeError(f"Failed to read target schema on '{dst_tgt.display_name}': {dst_res.get('error')}")
+
+        target_dialect = infer_sql_diff_dialect = infer_sql_dialect(dst_tgt.jdbc_url)
+        diff_report = compute_schema_diff(
+            source_tables=src_res.get("tables") or {},
+            target_tables=dst_res.get("tables") or {},
+            target_dialect=infer_sql_diff_dialect,
+        )
+
+        dbeaver_launch: Optional[Dict[str, Any]] = None
+        if bool(args.get("open_patch_in_dbeaver", False)) and diff_report["suggested_sync_ddl"]:
+            script_path = write_dbeaver_ddl_migration_script(
+                output_dir=self.remediation_dir,
+                migration_title=f"Sync {src_tgt.display_name} to {dst_tgt.display_name}",
+                table=table_pattern if table_pattern != "%" else "(schema_sync)",
+                ddl_statements=diff_report["suggested_sync_ddl"],
+                rollback_ddl_sql="\n".join(diff_report["reverse_rollback_ddl"]) or "-- No reverse DDL",
+                warnings=[],
+                dbeaver_conn_name=dst_tgt.dbeaver_conn_name,
+                database_name=dst_tgt.target_db,
+            )
+            if bool(args.get("_skip_gui_for_test", False)):
+                dbeaver_launch = {"launched": False, "script_path": str(script_path)}
+            else:
+                dbeaver_launch = launch_script_in_dbeaver(
+                    script_path=script_path,
+                    dbeaver_conn_name=dst_tgt.dbeaver_conn_name,
+                    dbeaver_exe=self.dbeaver_exe,
+                )
+
+        return {
+            "source": {"connection": src_tgt.display_name, "database": src_res.get("activeDatabase") or src_tgt.target_db},
+            "target": {
+                "connection": dst_tgt.display_name,
+                "database": dst_res.get("activeDatabase") or dst_tgt.target_db,
+                "dialect": target_dialect,
+            },
+            **diff_report,
+            "dbeaver_patch_handoff": dbeaver_launch,
+        }
+
+    def tool_rollback_by_change_id(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        One-Click Rollback by change_id:
+        Locates the original audit entry & rollback.sql. On allowed local dev connections,
+        atomically executes all reverse restore DML statements in one transaction; on remote
+        connections (or DDL changes / when open_in_dbeaver=True), opens rollback.sql in DBeaver.
+        """
+        self.reload_config()
+        change_id = (args.get("change_id") or "").strip()
+        if not change_id:
+            raise ValueError("change_id is required.")
+
+        entry = self.auditor.find_entry_by_change_id(change_id)
+        if not entry:
+            raise ValueError(f"No modification entry found for change_id '{change_id}'.")
+
+        rb_path = Path(entry.get("rollback_sql_path") or "")
+        if not rb_path.is_file():
+            raise FileNotFoundError(f"Rollback SQL file missing on disk: {rb_path}")
+
+        conn_name = entry.get("connection")
+        db_name = entry.get("database") or ""
+        table = entry.get("table") or ""
+        tgt = self._resolve_target(conn_name, db_name, for_write=True)
+
+        force_dbeaver = bool(args.get("open_in_dbeaver", False))
+        is_ddl = str(entry.get("dml_verb", "")).upper() == "DDL"
+
+        if force_dbeaver or is_ddl or not tgt.allow_direct_apply:
+            if bool(args.get("_skip_gui_for_test", False)):
+                launch_res: Dict[str, Any] = {"launched": False, "script_path": str(rb_path)}
+            else:
+                launch_res = launch_script_in_dbeaver(
+                    script_path=rb_path,
+                    dbeaver_conn_name=tgt.dbeaver_conn_name,
+                    dbeaver_exe=self.dbeaver_exe,
+                )
+            return {
+                "change_id": change_id,
+                "mode": "opened_in_dbeaver",
+                "committed_directly": False,
+                "reason": (
+                    "DDL rollback requires human review"
+                    if is_ddl
+                    else ("Requested open_in_dbeaver=true" if force_dbeaver else "Remote connection policy")
+                ),
+                **launch_res,
+            }
+
+        # Parse active DML restore statements (UPDATE / INSERT / DELETE) from rollback.sql
+        rb_text = rb_path.read_text(encoding="utf-8")
+        raw_stmts, split_err = split_sql_statements_safe(rb_text)
+        if split_err:
+            raise RuntimeError(f"Failed to parse rollback.sql: {split_err}")
+
+        dml_stmts: List[str] = []
+        for st in raw_stmts:
+            verb = _extract_dml_verb(st)
+            if verb in {"UPDATE", "INSERT", "DELETE"}:
+                dml_stmts.append(st)
+
+        if not dml_stmts:
+            raise ValueError(f"No executable UPDATE/INSERT/DELETE statements found in {rb_path}.")
+
+        batch_res = self.jdbc.request(
+            mode="EXEC_BATCH",
+            jdbc_url=tgt.jdbc_url,
+            user_spec=tgt.user_spec,
+            pass_spec=tgt.pass_spec,
+            target_db=tgt.target_db,
+            props_text=tgt.props_text,
+            timeout_sec=self.query_timeout_sec,
+            dry_run=False,
+            arg1=json.dumps(dml_stmts, ensure_ascii=False),
+        )
+        if not batch_res.get("ok"):
+            raise RuntimeError(f"Atomic rollback failed (nothing changed): {batch_res.get('error')}")
+
+        affected = int(batch_res.get("affectedRows", 0))
+        existing_backup_paths = {
+            "bundle_dir": str(entry.get("backup_bundle_dir", "")),
+            "backup_json_path": str(entry.get("backup_json_path", "")),
+            "insert_sql_path": str(entry.get("before_rows_insert_sql", "")),
+            "rollback_sql_path": str(rb_path),
+        }
+        log_paths = self.auditor.record_audit_log(
+            change_id=f"{change_id}_ROLLBACK",
+            channel="ROLLBACK_EXECUTION",
+            status="ROLLED_BACK_RESTORED",
+            connection=tgt.display_name,
+            database=tgt.target_db,
+            table=table,
+            dml_verb="ROLLBACK_DML",
+            where_clause=str(entry.get("where_clause", "")),
+            dml_sql="; ".join(dml_stmts),
+            issue_summary=f"Rollback of change_id {change_id}",
+            affected_rows=affected,
+            columns=[],
+            primary_keys=[],
+            before_rows_unmasked=[],
+            after_rows_unmasked=[],
+            backup_paths=existing_backup_paths,
+        )
+
+        return {
+            "rolled_back_change_id": change_id,
+            "mode": "atomic_direct_rollback",
+            "committed_directly": True,
+            "connection": tgt.display_name,
+            "database": tgt.target_db,
+            "table": table,
+            "executed_statement_count": len(dml_stmts),
+            "restored_or_cleaned_rows": affected,
+            "audit_log_markdown": log_paths["audit_markdown_path"],
+        }
 
 
 COMMON_TARGET_PROPS: Dict[str, Any] = {
@@ -1568,6 +1778,56 @@ TOOLS_MANIFEST: List[Dict[str, Any]] = [
         },
     },
     {
+        "name": "diff_schema",
+        "description": (
+            "Compares database schemas between two environments (e.g. localhost dev vs SIT/staging) in a single "
+            "bulk metadata sweep. Reports missing tables, missing/extra columns, type/nullability mismatches, "
+            "and generates dialect-aware incremental ALTER/CREATE sync DDL (optionally opening it in DBeaver)."
+        ),
+        "annotations": {
+            "title": "Compare Schemas Across Environments",
+            "readOnlyHint": True,
+            "destructiveHint": False,
+            "idempotentHint": True,
+            "openWorldHint": False,
+        },
+        "inputSchema": {
+            "type": "object",
+            "required": ["source_connection", "target_connection"],
+            "properties": {
+                "source_connection": {"type": "string", "description": "Reference DBeaver connection (e.g. 'localhost')."},
+                "source_database": {"type": "string", "description": "Optional reference database/schema."},
+                "target_connection": {"type": "string", "description": "Target DBeaver connection to compare against (e.g. 'staging-db')."},
+                "target_database": {"type": "string", "description": "Optional target database/schema."},
+                "table_pattern": {"type": "string", "description": "Optional SQL LIKE table filter (default '%')."},
+                "open_patch_in_dbeaver": {"type": "boolean", "default": False},
+            },
+        },
+    },
+    {
+        "name": "rollback_by_change_id",
+        "description": (
+            "One-click rollback or test-seed cleanup using a recorded change_id from apply_remediation, "
+            "seed_dev_test_data, or open_remediation_in_dbeaver. Atomically executes reverse DML on allowed "
+            "dev connections, or opens rollback.sql in DBeaver on remote connections."
+        ),
+        "annotations": {
+            "title": "Rollback Modification by Change ID",
+            "readOnlyHint": False,
+            "destructiveHint": True,
+            "idempotentHint": False,
+            "openWorldHint": False,
+        },
+        "inputSchema": {
+            "type": "object",
+            "required": ["change_id"],
+            "properties": {
+                "change_id": {"type": "string", "description": "The change_id recorded in modification_audit."},
+                "open_in_dbeaver": {"type": "boolean", "default": False, "description": "Force opening rollback.sql in DBeaver instead of direct execution."},
+            },
+        },
+    },
+    {
         "name": "list_modification_history",
         "description": (
             "Lists chronological database modification audit logs, field diffs, original data backup paths, "
@@ -1606,6 +1866,8 @@ class McpStdioServer:
             "apply_remediation": self.app.tool_apply_remediation,
             "open_ddl_migration_in_dbeaver": self.app.tool_open_ddl_migration_in_dbeaver,
             "seed_dev_test_data": self.app.tool_seed_dev_test_data,
+            "diff_schema": self.app.tool_diff_schema,
+            "rollback_by_change_id": self.app.tool_rollback_by_change_id,
             "list_modification_history": self.app.tool_list_modification_history,
         }
 
