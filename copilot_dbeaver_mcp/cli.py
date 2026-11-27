@@ -1,5 +1,5 @@
 """
-CLI entrypoint for db-guard-mcp (`db-guard-mcp` or `python -m db_guard`).
+CLI entrypoint for copilot-dbeaver-mcp (`copilot-dbeaver-mcp` or `python -m copilot_dbeaver_mcp`).
 """
 
 from __future__ import annotations
@@ -11,14 +11,14 @@ import sys
 from pathlib import Path
 from typing import Optional, Sequence
 
-from db_guard import __version__
-from db_guard.dbeaver_bridge import (
+from copilot_dbeaver_mcp import __version__
+from copilot_dbeaver_mcp.dbeaver_bridge import (
     find_dbeaver_driver_dirs,
     find_dbeaver_exe,
     find_dbeaver_sshj_jars,
     load_dbeaver_connections,
 )
-from db_guard.server import DbGuardApp, McpStdioServer
+from copilot_dbeaver_mcp.server import DbGuardApp, McpStdioServer
 
 
 def run_doctor(app: DbGuardApp) -> int:
@@ -69,16 +69,16 @@ def run_doctor(app: DbGuardApp) -> int:
 
 def main(argv: Optional[Sequence[str]] = None) -> None:
     parser = argparse.ArgumentParser(
-        prog="db-guard-mcp",
+        prog="copilot-dbeaver-mcp",
         description="Zero-password DBeaver MCP Server with read-only isolation, PII masking, mandatory backups, and audit trails.",
     )
-    parser.add_argument("--version", action="version", version=f"db-guard-mcp {__version__}")
+    parser.add_argument("--version", action="version", version=f"copilot-dbeaver-mcp {__version__}")
     parser.add_argument("--config", type=str, default=None, help="Path to YAML configuration file.")
     parser.add_argument(
         "--storage-dir",
         type=str,
         default=None,
-        help="Directory for backups, change logs, and compiled JDBC bridge (default: ~/.db-guard-mcp).",
+        help="Directory for backups, change logs, and compiled JDBC bridge (default: ~/.copilot-dbeaver-mcp).",
     )
     parser.add_argument(
         "--doctor",

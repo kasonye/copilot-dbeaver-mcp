@@ -300,7 +300,7 @@ def write_dbeaver_remediation_script(
     rb_note = rollback_sql_path or "(embedded at bottom of this file)"
 
     content = f"""-- ============================================================================
--- DB-Guard Safe Remediation Script (Pre-Backed-Up & Audited)
+-- Copilot-DBeaver-MCP Safe Remediation Script (Pre-Backed-Up & Audited)
 -- Generated At     : {dt.datetime.now().isoformat(timespec="seconds")}
 -- Issue Summary    : {issue_title}
 -- DBeaver Conn     : {conn_note}
@@ -374,7 +374,7 @@ def write_dbeaver_ddl_migration_script(
     forward_sql = "\n\n".join(s.rstrip(";") + ";" for s in ddl_statements)
 
     content = f"""-- ============================================================================
--- DB-Guard Safe Schema Migration (DDL) Review Script
+-- Copilot-DBeaver-MCP Safe Schema Migration (DDL) Review Script
 -- Generated At     : {dt.datetime.now().isoformat(timespec="seconds")}
 -- Migration Title  : {migration_title}
 -- DBeaver Conn     : {dbeaver_conn_name or "(select connection in DBeaver toolbar)"}

@@ -1,12 +1,12 @@
 # Security Architecture & Threat Model
 
-`db-guard-mcp` is designed for engineering teams that want AI coding agents (GitHub Copilot, Cursor, Claude Code, etc.) to diagnose bad database records and assist with safe data remediation **without risking accidental data destruction, production table locks, or PII leakage to cloud LLMs**.
+`copilot-dbeaver-mcp` is designed for engineering teams that want AI coding agents (GitHub Copilot, Cursor, Claude Code, etc.) to diagnose bad database records and assist with safe data remediation **without risking accidental data destruction, production table locks, or PII leakage to cloud LLMs**.
 
 ---
 
 ## 1. Threat Model
 
-| Threat | How Naive DB MCP Servers Fail | How `db-guard-mcp` Mitigates It |
+| Threat | How Naive DB MCP Servers Fail | How `copilot-dbeaver-mcp` Mitigates It |
 | :--- | :--- | :--- |
 | **Plaintext Password Exposure** | Requiring plaintext DSNs in `.mcp.json` or repo config files, or exposing credentials to LLM tool outputs | Zero-password config: decrypts DBeaver's `credentials-config.json` **strictly inside local JVM heap memory** (`JdbcBridge`). Credentials are never written to disk, logs, Python dicts, or MCP responses. |
 | **Read-Only Bypass / Stacked SQL Injection** | Relying solely on regex keyword checks while leaving `allowMultiQueries=true` or writable CTEs open | **Triple Lock**: ① Lexer strips comments/literals, blocks `;`, MySQL `/*!...*/`, writable `WITH` CTEs, `INTO OUTFILE`, `LOAD_FILE`, `FOR UPDATE`; ② JDBC URL forces `allowMultiQueries=false`; ③ Database session executes `Connection.setReadOnly(true)` + `SET SESSION TRANSACTION READ ONLY` (`SET TRANSACTION READ ONLY` on Oracle) and always calls `conn.rollback()` in `finally`. |
@@ -19,4 +19,4 @@
 
 ## 2. Defense-in-Depth Recommendation for Production Databases
 
-While `db-guard-mcp` enforces session-level `READ ONLY` transactions and blocks direct writes on non-allowlisted connections, database engine permissions remain the ultimate security boundary. For production environments, we strongly recommend configuring a dedicated read-only database user in DBeaver (`GRANT SELECT, SHOW VIEW`) and keeping production connection names out of `allow_direct_apply_connections`.
+While `copilot-dbeaver-mcp` enforces session-level `READ ONLY` transactions and blocks direct writes on non-allowlisted connections, database engine permissions remain the ultimate security boundary. For production environments, we strongly recommend configuring a dedicated read-only database user in DBeaver (`GRANT SELECT, SHOW VIEW`) and keeping production connection names out of `allow_direct_apply_connections`.

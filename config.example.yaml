@@ -1,6 +1,6 @@
 # ============================================================================
-# DB-Guard MCP Configuration Template (Zero-Password Edition)
-# Copy to ~/.db-guard-mcp/config.yaml or ./config.local.yaml to customize.
+# Copilot DBeaver MCP Configuration Template (Zero-Password Edition)
+# Copy to ~/.copilot-dbeaver-mcp/config.yaml or ./config.local.yaml to customize.
 # No database usernames or passwords are needed — DBeaver connections are reused automatically!
 # ============================================================================
 
@@ -10,8 +10,8 @@ default_connection: "localhost"
 default_database: ""
 
 # Optional custom directory for backups, change-logs, and compiled Java bridge
-# Defaults to ~/.db-guard-mcp
-# storage_dir: "~/.db-guard-mcp"
+# Defaults to ~/.copilot-dbeaver-mcp
+# storage_dir: "~/.copilot-dbeaver-mcp"
 
 security:
   # Per-query execution timeout in seconds

@@ -1,4 +1,4 @@
-# DB-Guard MCP
+# Copilot DBeaver MCP
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-3776AB.svg)](https://www.python.org/)
@@ -7,7 +7,7 @@
 
 **[简体中文文档 (Chinese README)](./README.zh-CN.md)** | **[Security Architecture](./SECURITY.md)**
 
-**DB-Guard MCP** is a zero-password, defense-in-depth **Model Context Protocol (MCP)** server that bridges AI coding assistants (**GitHub Copilot** in IntelliJ IDEA & VS Code, **Cursor**, **Claude Code / Desktop**) with the databases already configured in your local **DBeaver** — across **MariaDB, MySQL, Oracle, PostgreSQL, GaussDB, and H2** on Windows, macOS, and Linux.
+**Copilot DBeaver MCP** is a zero-password, defense-in-depth **Model Context Protocol (MCP)** server that bridges AI coding assistants (**GitHub Copilot** in IntelliJ IDEA & VS Code, **Cursor**, **Claude Code / Desktop**) with the databases already configured in your local **DBeaver** — across **MariaDB, MySQL, Oracle, PostgreSQL, GaussDB, and H2** on Windows, macOS, and Linux.
 
 It is purpose-built for **both daily feature development and production-grade incident debugging**: generating code against real schemas, validating query plans, seeding & cleaning up local integration test data, safely reviewing schema migrations (DDL), and remediating corrupted records with mandatory backups and audit logs.
 
@@ -32,11 +32,11 @@ It is purpose-built for **both daily feature development and production-grade in
 
 ```mermaid
 flowchart LR
-    IDE["IDE AI Agent<br/>(GitHub Copilot / Cursor / Claude)"] <-->|"MCP stdio (JSON-RPC)"| PY["db-guard-mcp (Python)<br/>SQL AST Guard + PII Masker + Auditor"]
+    IDE["IDE AI Agent<br/>(GitHub Copilot / Cursor / Claude)"] <-->|"MCP stdio (JSON-RPC)"| PY["copilot-dbeaver-mcp (Python)<br/>SQL AST Guard + PII Masker + Auditor"]
     PY <-->|"Single-Statement Pipe"| JVM["JdbcBridge (JVM)<br/>In-Memory DBeaver Vault + SSHJ Tunnel"]
     DBV[("Local DBeaver Workspace<br/>data-sources.json + drivers")] -.->|"Auto-Discover"| JVM
     JVM <-->|"READ ONLY Lock / Atomic Tx"| DB[("MariaDB / MySQL / Oracle /<br/>PostgreSQL / GaussDB")]
-    PY -->|"Fail-Closed Pre-Backup"| BKP["~/.db-guard-mcp/<br/>audit-backups/ & change-logs/"]
+    PY -->|"Fail-Closed Pre-Backup"| BKP["~/.copilot-dbeaver-mcp/<br/>audit-backups/ & change-logs/"]
     PY -->|"1-Click Transaction Script"| GUI["DBeaver Desktop UI<br/>(Manual Review & COMMIT)"]
 ```
 
@@ -63,12 +63,12 @@ pip install -e .
 Verify your environment, JDBC drivers, and DBeaver connection discovery:
 
 ```bash
-db-guard-mcp --doctor
+copilot-dbeaver-mcp --doctor
 ```
 
 ### 2. Connect to GitHub Copilot (IntelliJ IDEA / VS Code)
 
-Add `db-guard-mcp` to your global MCP configuration so it works across **every project** without adding files to business repositories:
+Add `copilot-dbeaver-mcp` to your global MCP configuration so it works across **every project** without adding files to business repositories:
 
 - **IntelliJ IDEA / JetBrains IDEs**:
   - Windows: `%LOCALAPPDATA%\github-copilot\intellij\mcp.json`
@@ -78,16 +78,16 @@ Add `db-guard-mcp` to your global MCP configuration so it works across **every p
 ```json
 {
   "servers": {
-    "db-guard-dbeaver": {
+    "copilot-dbeaver-mcp": {
       "type": "stdio",
-      "command": "db-guard-mcp",
+      "command": "copilot-dbeaver-mcp",
       "args": []
     }
   }
 }
 ```
 
-*(Tip: If `db-guard-mcp` is not on your global PATH, set `"command": "/path/to/python"` and `"args": ["-m", "db_guard"]`.)*
+*(Tip: If `copilot-dbeaver-mcp` is not on your global PATH, set `"command": "/path/to/python"` and `"args": ["-m", "copilot_dbeaver_mcp"]`.)*
 
 ---
 
@@ -112,7 +112,7 @@ Add `db-guard-mcp` to your global MCP configuration so it works across **every p
 
 ## Configuration (Optional)
 
-Copy [`config.example.yaml`](./config.example.yaml) to `~/.db-guard-mcp/config.yaml` (or `./config.local.yaml`). Changes are **hot-reloaded** on every tool call without restarting your IDE.
+Copy [`config.example.yaml`](./config.example.yaml) to `~/.copilot-dbeaver-mcp/config.yaml` (or `./config.local.yaml`). Changes are **hot-reloaded** on every tool call without restarting your IDE.
 
 ---
 

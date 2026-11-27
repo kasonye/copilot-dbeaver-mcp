@@ -1,5 +1,5 @@
 """
-DB-Guard MCP Server Core Implementation.
+Copilot DBeaver MCP Server Core Implementation.
 """
 
 from __future__ import annotations
@@ -18,9 +18,9 @@ from typing import Any, Dict, List, Optional
 
 import yaml
 
-from db_guard import __version__
-from db_guard.audit_logger import ModificationAuditor
-from db_guard.dbeaver_bridge import (
+from copilot_dbeaver_mcp import __version__
+from copilot_dbeaver_mcp.audit_logger import ModificationAuditor
+from copilot_dbeaver_mcp.dbeaver_bridge import (
     find_dbeaver_driver_dirs,
     find_dbeaver_sshj_jars,
     launch_script_in_dbeaver,
@@ -29,7 +29,7 @@ from db_guard.dbeaver_bridge import (
     write_dbeaver_ddl_migration_script,
     write_dbeaver_remediation_script,
 )
-from db_guard.sql_guard import (
+from copilot_dbeaver_mcp.sql_guard import (
     DynamicDataMasker,
     build_rollback_sql,
     build_seed_batch_sql,
@@ -41,7 +41,7 @@ from db_guard.sql_guard import (
 
 PACKAGE_DIR = Path(__file__).resolve().parent
 REPO_ROOT = PACKAGE_DIR.parent
-DEFAULT_USER_HOME_DIR = Path.home() / ".db-guard-mcp"
+DEFAULT_USER_HOME_DIR = Path.home() / ".copilot-dbeaver-mcp"
 SUPPORTED_PROTOCOL_VERSIONS = {"2024-11-05", "2025-03-26", "2025-06-18"}
 
 
@@ -229,7 +229,7 @@ class JdbcBridgeProcess:
 
 
 def resolve_default_config_path() -> Path:
-    env_cfg = os.environ.get("DB_GUARD_CONFIG")
+    env_cfg = os.environ.get("COPILOT_DBEAVER_CONFIG")
     if env_cfg:
         return Path(os.path.expanduser(os.path.expandvars(env_cfg)))
     for candidate in (
@@ -247,7 +247,7 @@ class DbGuardApp:
         self, config_path: Optional[Path] = None, storage_dir: Optional[Path] = None
     ) -> None:
         self.config_path = config_path or resolve_default_config_path()
-        env_storage = os.environ.get("DB_GUARD_STORAGE_DIR")
+        env_storage = os.environ.get("COPILOT_DBEAVER_STORAGE_DIR")
         if storage_dir:
             self.storage_root = storage_dir
         elif env_storage:
@@ -266,7 +266,7 @@ class DbGuardApp:
                 raw = yaml.safe_load(f) or {}
 
         self.config = raw
-        if raw.get("storage_dir") and not os.environ.get("DB_GUARD_STORAGE_DIR"):
+        if raw.get("storage_dir") and not os.environ.get("COPILOT_DBEAVER_STORAGE_DIR"):
             self.storage_root = Path(os.path.expanduser(os.path.expandvars(str(raw["storage_dir"]))))
             self.remediation_dir = self.storage_root / "remediations"
 
@@ -1626,7 +1626,7 @@ class McpStdioServer:
                 "result": {
                     "protocolVersion": negotiated,
                     "capabilities": {"tools": {"listChanged": False}},
-                    "serverInfo": {"name": "db-guard-mcp", "version": __version__},
+                    "serverInfo": {"name": "copilot-dbeaver-mcp", "version": __version__},
                 },
             }
 

@@ -1,5 +1,5 @@
 """
-SQL AST/Lexer Guardrails & Structural PII Dynamic Masking for db-guard-mcp.
+SQL AST/Lexer Guardrails & Structural PII Dynamic Masking for copilot-dbeaver-mcp.
 
 Defense-in-depth layer complementing database account grants and JDBC wire-protocol
 read-only / single-statement isolation.

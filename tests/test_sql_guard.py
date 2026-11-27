@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from db_guard.sql_guard import (
+from copilot_dbeaver_mcp.sql_guard import (
     DynamicDataMasker,
     build_insert_backup_sql,
     build_rollback_sql,

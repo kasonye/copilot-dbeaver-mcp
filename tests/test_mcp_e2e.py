@@ -9,7 +9,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from db_guard.server import JdbcBridgeProcess, discover_default_driver_paths
+from copilot_dbeaver_mcp.server import JdbcBridgeProcess, discover_default_driver_paths
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -83,7 +83,7 @@ def call_tool(proc: subprocess.Popen[bytes], req_id: int, name: str, arguments: 
 
 class McpEndToEndTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.tmp_dir = Path(tempfile.mkdtemp(prefix="db_guard_e2e_"))
+        self.tmp_dir = Path(tempfile.mkdtemp(prefix="copilot_dbeaver_e2e_"))
         self.drivers = discover_default_driver_paths()
         has_h2 = any("h2" in p.lower() for p in self.drivers)
         if not has_h2:
@@ -182,12 +182,12 @@ dbeaver:
         )
 
         env = os.environ.copy()
-        env["DB_GUARD_CONFIG"] = str(cfg_file)
-        env["DB_GUARD_STORAGE_DIR"] = str(storage_dir)
+        env["COPILOT_DBEAVER_CONFIG"] = str(cfg_file)
+        env["COPILOT_DBEAVER_STORAGE_DIR"] = str(storage_dir)
         env["PYTHONPATH"] = str(REPO_ROOT)
 
         proc = subprocess.Popen(
-            [sys.executable, "-m", "db_guard"],
+            [sys.executable, "-m", "copilot_dbeaver_mcp"],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -204,7 +204,7 @@ dbeaver:
                     "params": {"protocolVersion": "2025-03-26", "capabilities": {}},
                 },
             )
-            self.assertEqual(init_resp["result"]["serverInfo"]["name"], "db-guard-mcp")
+            self.assertEqual(init_resp["result"]["serverInfo"]["name"], "copilot-dbeaver-mcp")
 
             tools_resp = send_rpc(proc, {"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
             self.assertEqual(len(tools_resp["result"]["tools"]), 12)

@@ -232,7 +232,7 @@ class ModificationAuditor:
 
         if not self.md_log_path.is_file():
             self.md_log_path.write_text(
-                "# 数据库修改与备份审计台账 (DB-Guard Audit Log)\n\n"
+                "# 数据库修改与备份审计台账 (Copilot-DBeaver-MCP Audit Log)\n\n"
                 "> 每次修改操作均已在执行前自动生成完整未脱敏原始行冷备与可执行逆向回滚 SQL。\n\n",
                 encoding="utf-8",
             )

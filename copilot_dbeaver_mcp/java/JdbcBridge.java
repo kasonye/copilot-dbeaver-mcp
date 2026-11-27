@@ -340,7 +340,7 @@ public class JdbcBridge {
                     listenMethod.invoke(forwarder);
                 } catch (Throwable ignored) {
                 }
-            }, "db-guard-ssh-" + connId);
+            }, "copilot-dbeaver-ssh-" + connId);
             tunnelThread.setDaemon(true);
             tunnelThread.start();
 
