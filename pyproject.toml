@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "db-guard-mcp"
+version = "1.0.0"
+description = "Zero-password DBeaver MCP Server for GitHub Copilot & AI Agents — featuring engine-level READ ONLY locks, dynamic PII masking, rolled-back dry-runs, and mandatory pre-modification backups."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+keywords = [
+    "mcp",
+    "model-context-protocol",
+    "dbeaver",
+    "database",
+    "github-copilot",
+    "sql-safety",
+    "pii-masking",
+    "jdbc",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Database",
+    "Topic :: Security",
+]
+dependencies = [
+    "PyYAML>=6.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/kasonye/copilot-dbeaver-mcp"
+Repository = "https://github.com/kasonye/copilot-dbeaver-mcp.git"
+Issues = "https://github.com/kasonye/copilot-dbeaver-mcp/issues"
+
+[project.scripts]
+db-guard-mcp = "db_guard.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["db_guard*"]
+
+[tool.setuptools.package-data]
+"db_guard" = ["java/*.java"]

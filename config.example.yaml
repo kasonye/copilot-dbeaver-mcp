@@ -1,0 +1,41 @@
+# ============================================================================
+# DB-Guard MCP Configuration Template (Zero-Password Edition)
+# Copy to ~/.db-guard-mcp/config.yaml or ./config.local.yaml to customize.
+# No database usernames or passwords are needed — DBeaver connections are reused automatically!
+# ============================================================================
+
+# Default DBeaver connection name when 'connection' is omitted in tool calls
+default_connection: "localhost"
+# Optional default database/schema name (leave empty to auto-detect per connection/project)
+default_database: ""
+
+# Optional custom directory for backups, change-logs, and compiled Java bridge
+# Defaults to ~/.db-guard-mcp
+# storage_dir: "~/.db-guard-mcp"
+
+security:
+  # Per-query execution timeout in seconds
+  query_timeout_sec: 10
+  # Default and hard-cap row limits for diagnostic SELECT queries
+  default_max_rows: 100
+  hard_max_rows: 500
+  # Circuit breaker: maximum rows a single remediation statement may affect
+  max_write_rows: 20
+  # Mask PII columns (IDs, names, phones, emails, secrets) while preserving length & whitespace anomalies
+  mask_sensitive_data: true
+  extra_sensitive_column_patterns: []
+  exempt_columns:
+    - "status_name"
+    - "type_name"
+    - "role_name"
+  # DBeaver connection names allowed to commit directly via apply_remediation.
+  # Connections NOT listed here still support read-only diagnostics, rolled-back dry-run previews,
+  # and 1-click handoff to DBeaver (with mandatory backup + audit logging).
+  allow_direct_apply_connections:
+    - "localhost"
+    - "127.0.0.1"
+
+dbeaver:
+  # Leave empty for automatic cross-platform detection (Windows / macOS / Linux)
+  executable_path: ""
+  datasources_json: ""

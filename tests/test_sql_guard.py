@@ -1,0 +1,119 @@
+from __future__ import annotations
+
+import unittest
+
+from db_guard.sql_guard import (
+    DynamicDataMasker,
+    build_insert_backup_sql,
+    build_rollback_sql,
+    validate_readonly_sql,
+    validate_remediation_sql,
+)
+
+
+class SqlGuardUnitTests(unittest.TestCase):
+    def test_valid_readonly_queries(self) -> None:
+        for sql in [
+            "SELECT id, status FROM orders WHERE id = 42;",
+            "WITH recent AS (SELECT id FROM orders LIMIT 10) SELECT * FROM recent",
+            "SHOW CREATE TABLE orders",
+            "EXPLAIN SELECT * FROM orders WHERE customer_id = 7",
+        ]:
+            cleaned, err = validate_readonly_sql(sql)
+            self.assertIsNone(err, f"Unexpected error for {sql}: {err}")
+            self.assertTrue(cleaned)
+
+    def test_blocks_dangerous_readonly_queries(self) -> None:
+        dangerous = [
+            "SELECT 1; DROP TABLE orders",
+            "DELETE FROM orders WHERE id = 1",
+            "UPDATE orders SET status = 'PAID' WHERE id = 1",
+            "WITH del AS (DELETE FROM orders RETURNING *) SELECT * FROM del",
+            "SELECT /*!50000 DROP TABLE orders */ 1",
+            "SELECT * FROM orders FOR UPDATE",
+            "SELECT * INTO OUTFILE '/tmp/dump.csv' FROM orders",
+            "SELECT SLEEP(10)",
+            "SELECT LOAD_FILE('/etc/passwd')",
+        ]
+        for sql in dangerous:
+            _, err = validate_readonly_sql(sql)
+            self.assertIsNotNone(err, f"Failed to block dangerous query: {sql}")
+
+    def test_remediation_validation_rules(self) -> None:
+        sel, dml, err = validate_remediation_sql(
+            "orders",
+            "order_id = 1001",
+            "UPDATE orders SET status = 'CANCELLED' WHERE order_id = 1001;",
+        )
+        self.assertIsNone(err)
+        self.assertEqual(sel, "SELECT * FROM orders WHERE order_id = 1001")
+        self.assertEqual(dml, "UPDATE orders SET status = 'CANCELLED' WHERE order_id = 1001")
+
+        # Block tautology & missing WHERE & DDL
+        for bad_where, bad_dml in [
+            ("1=1", "UPDATE orders SET status = 'PAID' WHERE 1=1"),
+            ("TRUE", "DELETE FROM orders WHERE TRUE"),
+            ("order_id = 1 OR 1=1", "DELETE FROM orders WHERE order_id = 1 OR 1=1"),
+            ("order_id > 0", "UPDATE orders SET status = 'PAID' WHERE order_id > 0"),
+            ("order_id = 1", "UPDATE orders SET status = 'PAID'"),
+            ("order_id = 1", "TRUNCATE TABLE orders"),
+        ]:
+            _, _, b_err = validate_remediation_sql("orders", bad_where, bad_dml)
+            self.assertIsNotNone(b_err, f"Failed to block unsafe remediation: {bad_dml}")
+
+    def test_dynamic_pii_masking_preserves_anomalies(self) -> None:
+        masker = DynamicDataMasker(enabled=True)
+        cols = [
+            {"name": "order_id", "type": "INT"},
+            {"name": "status_name", "type": "VARCHAR"},
+            {"name": "customer_name", "type": "VARCHAR"},
+            {"name": "email", "type": "VARCHAR"},
+            {"name": "notes", "type": "VARCHAR"},
+        ]
+        rows = [
+            [101, "PENDING_REVIEW", "Alice Walker  ", "alice@example.com", "A123456(7)"],
+            [102, "ACTIVE", "", None, "normal note"],
+        ]
+        masked, masked_cols = masker.mask_rows(cols, rows)
+        self.assertEqual(masked_cols, ["customer_name", "email"])
+        self.assertEqual(masked[0][0], 101)
+        # Exempt technical column status_name stays readable
+        self.assertEqual(masked[0][1], "PENDING_REVIEW")
+        # Trailing whitespace anomaly preserved while name is masked
+        self.assertNotIn("Alice", masked[0][2])
+        self.assertIn("trail_ws=2", masked[0][2])
+        # Email masked
+        self.assertNotIn("alice@example.com", masked[0][3])
+        # Value-level ID pattern detected even in generic 'notes' column
+        self.assertIn("MASKED:HKID_LIKE", masked[0][4])
+        # Empty string vs None preserved
+        self.assertEqual(masked[1][2], "")
+        self.assertIsNone(masked[1][3])
+
+    def test_rollback_and_insert_builders(self) -> None:
+        cols = [{"name": "order_id", "type": "INT"}, {"name": "status", "type": "VARCHAR"}]
+        before = [[55, "BROKEN_STATE"]]
+        after = [[55, "FIXED_STATE"]]
+
+        upd_rb = build_rollback_sql(
+            "orders", cols, before, after, primary_keys=["order_id"], dml_verb="UPDATE"
+        )
+        self.assertIn("UPDATE orders SET `status` = 'BROKEN_STATE' WHERE `order_id` = 55;", upd_rb)
+
+        del_rb = build_rollback_sql(
+            "orders", cols, before, [], primary_keys=["order_id"], dml_verb="DELETE"
+        )
+        self.assertIn("INSERT INTO orders (`order_id`, `status`) VALUES (55, 'BROKEN_STATE');", del_rb)
+
+        ins_rb = build_rollback_sql(
+            "orders", cols, [], after, primary_keys=["order_id"], dml_verb="INSERT"
+        )
+        self.assertIn("DELETE FROM orders WHERE `order_id` = 55;", ins_rb)
+
+        cold_sql = build_insert_backup_sql("orders", cols, before, database="shop_db")
+        self.assertIn("USE `shop_db`;", cold_sql)
+        self.assertIn("INSERT INTO orders", cold_sql)
+
+
+if __name__ == "__main__":
+    unittest.main()

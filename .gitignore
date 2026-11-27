@@ -1,0 +1,20 @@
+# Runtime backups, audit logs, generated SQL scripts, and local config
+config.local.yaml
+audit-backups/
+change-logs/
+remediations/
+
+# Compiled Java, Python bytecode & packaging build artifacts
+bin/
+build/
+dist/
+*.egg-info/
+__pycache__/
+**/__pycache__/
+*.pyc
+*.class
+
+# IDE folders
+.idea/
+.vscode/
+*.iml
