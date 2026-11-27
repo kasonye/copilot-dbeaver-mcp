@@ -244,7 +244,13 @@ dbeaver:
             self.assertEqual(init_resp["result"]["serverInfo"]["name"], "copilot-dbeaver-mcp")
 
             tools_resp = send_rpc(proc, {"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
-            self.assertEqual(len(tools_resp["result"]["tools"]), 14)
+            self.assertEqual(len(tools_resp["result"]["tools"]), 16)
+
+            # 0. Test diagnose_locks_and_blocking on H2
+            is_err, locks = call_tool(proc, 200, "diagnose_locks_and_blocking", {"connection": "localhost"})
+            self.assertFalse(is_err, locks)
+            self.assertEqual(locks["active_engine"], "jdbc")
+            self.assertTrue(len(locks["sections"]) >= 1)
 
             # 1. Read-only query + PII masking on staging-db
             is_err, diag = call_tool(

@@ -29,24 +29,24 @@ def run_doctor(app: DbGuardApp) -> int:
     conns = dbv_meta.get("connections") or []
 
     loaded_drivers = []
-    java_bridge_ok = False
-    java_err = None
-    if java_path and javac_path:
-        try:
-            ping = app.jdbc.request(mode="PING")
-            java_bridge_ok = bool(ping.get("ok"))
-            loaded_drivers = ping.get("drivers", [])
-        except Exception as exc:
-            java_err = str(exc)
-        finally:
-            app.jdbc.close()
+    bridge_ready = False
+    bridge_err = None
+    try:
+        ping = app.jdbc.request(mode="PING")
+        bridge_ready = bool(ping.get("ok"))
+        loaded_drivers = ping.get("drivers", [])
+    except Exception as exc:
+        bridge_err = str(exc)
+    finally:
+        app.jdbc.close()
 
     report = {
         "version": __version__,
         "platform": sys.platform,
         "python": sys.version.split()[0],
-        "java": {"java": java_path, "javac": javac_path, "bridge_ready": java_bridge_ok, "error": java_err},
-        "loaded_jdbc_drivers": loaded_drivers,
+        "active_engine": app.active_engine,
+        "java": {"java": java_path, "javac": javac_path},
+        "engine_status": {"ready": bridge_ready, "drivers": loaded_drivers, "error": bridge_err},
         "dbeaver": {
             "executable": dbeaver_exe,
             "workspace_files": dbv_meta.get("paths", []),
@@ -64,7 +64,7 @@ def run_doctor(app: DbGuardApp) -> int:
         },
     }
     print(json.dumps(report, ensure_ascii=False, indent=2))
-    return 0 if java_bridge_ok else 1
+    return 0 if bridge_ready else 1
 
 
 def main(argv: Optional[Sequence[str]] = None) -> None:

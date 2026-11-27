@@ -8,6 +8,7 @@ import base64
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -29,6 +30,9 @@ from copilot_dbeaver_mcp.dbeaver_bridge import (
     write_dbeaver_ddl_migration_script,
     write_dbeaver_remediation_script,
 )
+from copilot_dbeaver_mcp.lineage_graph import trace_related_record_graph
+from copilot_dbeaver_mcp.lock_inspector import inspect_locks_and_transactions
+from copilot_dbeaver_mcp.python_db_bridge import PythonDbBridge
 from copilot_dbeaver_mcp.schema_diff import compute_schema_diff
 from copilot_dbeaver_mcp.sql_guard import (
     DynamicDataMasker,
@@ -263,7 +267,8 @@ class DbGuardApp:
             self.storage_root = DEFAULT_USER_HOME_DIR
 
         self.remediation_dir = self.storage_root / "remediations"
-        self._jdbc: Optional[JdbcBridgeProcess] = None
+        self._jdbc: Optional[Any] = None
+        self.active_engine: str = "uninitialized"
         self._retention_purged_done = False
         self.reload_config()
 
@@ -311,17 +316,28 @@ class DbGuardApp:
         self.dbeaver_datasources = dbeaver_cfg.get("datasources_json") or None
 
         if self._jdbc is None:
-            driver_paths = discover_default_driver_paths(
-                dbeaver_exe=self.dbeaver_exe,
-                extra_paths=raw.get("extra_driver_jars"),
-            )
-            self._jdbc = JdbcBridgeProcess(
-                driver_paths=driver_paths,
-                compile_dir=self.storage_root / "bin",
-            )
+            engine_pref = (
+                os.environ.get("COPILOT_DBEAVER_ENGINE")
+                or str(raw.get("engine") or "auto")
+            ).strip().lower()
+            has_jdk = bool(shutil.which("java") and shutil.which("javac"))
+
+            if engine_pref == "python" or (engine_pref == "auto" and not has_jdk):
+                self._jdbc = PythonDbBridge()
+                self.active_engine = "python-fallback"
+            else:
+                driver_paths = discover_default_driver_paths(
+                    dbeaver_exe=self.dbeaver_exe,
+                    extra_paths=raw.get("extra_driver_jars"),
+                )
+                self._jdbc = JdbcBridgeProcess(
+                    driver_paths=driver_paths,
+                    compile_dir=self.storage_root / "bin",
+                )
+                self.active_engine = "jdbc"
 
     @property
-    def jdbc(self) -> JdbcBridgeProcess:
+    def jdbc(self) -> Any:
         assert self._jdbc is not None
         return self._jdbc
 
@@ -492,6 +508,7 @@ class DbGuardApp:
 
         ping = self.jdbc.request(mode="PING")
         return {
+            "active_engine": self.active_engine,
             "default_connection": self.default_connection,
             "default_database": self.default_database,
             "loaded_jdbc_drivers": ping.get("drivers", []),
@@ -1316,6 +1333,128 @@ class DbGuardApp:
             tail_lines=min(int(args.get("tail_lines", 8000)), 50000),
         )
 
+    def tool_trace_record_graph(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        1-Call Foreign-Key & Naming-Convention Record Lineage Graph:
+        Fetches root record + upstream parent rows + downstream child rows (all PII-masked),
+        and automatically flags ORPHAN_FOREIGN_KEY anomalies.
+        """
+        self.reload_config()
+        tgt = self._resolve_target(
+            args.get("connection") or args.get("profile"), args.get("database")
+        )
+        dialect = infer_sql_dialect(tgt.jdbc_url)
+
+        def _run_q(sql: str, cap: int) -> Dict[str, Any]:
+            r = self.jdbc.request(
+                mode="QUERY",
+                jdbc_url=tgt.jdbc_url,
+                user_spec=tgt.user_spec,
+                pass_spec=tgt.pass_spec,
+                target_db=tgt.target_db,
+                props_text=tgt.props_text,
+                timeout_sec=self.query_timeout_sec,
+                max_rows=cap,
+                arg1=sql,
+            )
+            if not r.get("ok"):
+                raise RuntimeError(str(r.get("error")))
+            return r
+
+        def _inspect_tbl(tname: str) -> Dict[str, Any]:
+            r = self.jdbc.request(
+                mode="SCHEMA",
+                jdbc_url=tgt.jdbc_url,
+                user_spec=tgt.user_spec,
+                pass_spec=tgt.pass_spec,
+                target_db=tgt.target_db,
+                props_text=tgt.props_text,
+                timeout_sec=self.query_timeout_sec,
+                max_rows=100,
+                arg1=tgt.target_db,
+                arg2=tname,
+            )
+            if not r.get("ok"):
+                raise RuntimeError(str(r.get("error")))
+            return r
+
+        def _bulk() -> Dict[str, Any]:
+            r = self.jdbc.request(
+                mode="BULK_SCHEMA",
+                jdbc_url=tgt.jdbc_url,
+                user_spec=tgt.user_spec,
+                pass_spec=tgt.pass_spec,
+                target_db=tgt.target_db,
+                props_text=tgt.props_text,
+                timeout_sec=self.query_timeout_sec,
+                max_rows=250,
+                arg1=tgt.target_db,
+                arg2="%",
+            )
+            if not r.get("ok"):
+                raise RuntimeError(str(r.get("error")))
+            return r
+
+        graph = trace_related_record_graph(
+            run_query_fn=_run_q,
+            inspect_table_fn=_inspect_tbl,
+            bulk_schema_fn=_bulk,
+            masker=self.masker,
+            dialect=dialect,
+            table=str(args.get("table") or ""),
+            pk_value=args.get("primary_key_value"),
+            where_clause=str(args.get("where_clause") or ""),
+            infer_implicit_fks=bool(args.get("infer_implicit_fks", True)),
+            max_child_tables=min(int(args.get("max_child_tables", 8)), 20),
+            max_rows_per_relation=min(int(args.get("max_rows_per_relation", 10)), 50),
+        )
+        return {
+            "connection": tgt.display_name,
+            "database": tgt.target_db,
+            "active_engine": self.active_engine,
+            **graph,
+        }
+
+    def tool_diagnose_locks_and_blocking(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Inspects active uncommitted transactions, lock-wait chains, and blocking sessions
+        across MySQL/MariaDB, PostgreSQL/GaussDB, Oracle, SQL Server, and H2 (strictly read-only).
+        """
+        self.reload_config()
+        tgt = self._resolve_target(
+            args.get("connection") or args.get("profile"), args.get("database")
+        )
+        dialect = infer_sql_dialect(tgt.jdbc_url)
+
+        def _run_q(sql: str, cap: int) -> Dict[str, Any]:
+            r = self.jdbc.request(
+                mode="QUERY",
+                jdbc_url=tgt.jdbc_url,
+                user_spec=tgt.user_spec,
+                pass_spec=tgt.pass_spec,
+                target_db=tgt.target_db,
+                props_text=tgt.props_text,
+                timeout_sec=self.query_timeout_sec,
+                max_rows=cap,
+                arg1=sql,
+            )
+            if not r.get("ok"):
+                raise RuntimeError(str(r.get("error")))
+            return r
+
+        report = inspect_locks_and_transactions(
+            run_query_fn=_run_q,
+            masker=self.masker,
+            dialect=dialect,
+            jdbc_url=tgt.jdbc_url,
+        )
+        return {
+            "connection": tgt.display_name,
+            "database": tgt.target_db,
+            "active_engine": self.active_engine,
+            **report,
+        }
+
     def tool_diff_schema(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """
         Compares schema metadata between source_connection/source_database (e.g. localhost dev)
@@ -1646,6 +1785,61 @@ TOOLS_MANIFEST: List[Dict[str, Any]] = [
         },
     },
     {
+        "name": "trace_record_graph",
+        "description": (
+            "1-Call Foreign-Key & Naming-Convention Record Lineage Graph: Given a root table and primary_key_value "
+            "(or where_clause), fetches the root row, upstream parent records, and downstream child records (all PII-masked), "
+            "and automatically flags ORPHAN_FOREIGN_KEY anomalies."
+        ),
+        "annotations": {
+            "title": "Trace Related Record Graph",
+            "readOnlyHint": True,
+            "destructiveHint": False,
+            "idempotentHint": True,
+            "openWorldHint": False,
+        },
+        "inputSchema": {
+            "type": "object",
+            "required": ["table"],
+            "properties": {
+                **COMMON_TARGET_PROPS,
+                "table": {"type": "string", "description": "Root table name."},
+                "primary_key_value": {
+                    "description": "Primary key value of the target record (int or string).",
+                },
+                "where_clause": {
+                    "type": "string",
+                    "description": "Alternative explicit WHERE condition if composite key or business code is used.",
+                },
+                "infer_implicit_fks": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "Also infer parent/child relations from *_id column naming conventions when physical FKs are absent.",
+                },
+                "max_child_tables": {"type": "integer", "default": 8},
+                "max_rows_per_relation": {"type": "integer", "default": 10},
+            },
+        },
+    },
+    {
+        "name": "diagnose_locks_and_blocking",
+        "description": (
+            "Read-only live lock-wait, deadlock, and uncommitted transaction inspector across MySQL/MariaDB "
+            "(innodb_trx / data_lock_waits), PostgreSQL/GaussDB (pg_stat_activity / pg_blocking_pids), Oracle, SQL Server, and H2."
+        ),
+        "annotations": {
+            "title": "Diagnose DB Locks & Blocking Transactions",
+            "readOnlyHint": True,
+            "destructiveHint": False,
+            "idempotentHint": True,
+            "openWorldHint": False,
+        },
+        "inputSchema": {
+            "type": "object",
+            "properties": {**COMMON_TARGET_PROPS},
+        },
+    },
+    {
         "name": "preview_remediation",
         "description": (
             "Runs a real transactional dry-run (START TRANSACTION -> pre-SELECT -> DML -> post-SELECT -> ROLLBACK) "
@@ -1928,6 +2122,8 @@ class McpStdioServer:
             "inspect_schema": self.app.tool_inspect_schema,
             "explain_query": self.app.tool_explain_query,
             "diagnose_query": self.app.tool_diagnose_query,
+            "trace_record_graph": self.app.tool_trace_record_graph,
+            "diagnose_locks_and_blocking": self.app.tool_diagnose_locks_and_blocking,
             "preview_remediation": self.app.tool_preview_remediation,
             "open_remediation_in_dbeaver": self.app.tool_open_remediation_in_dbeaver,
             "apply_remediation": self.app.tool_apply_remediation,

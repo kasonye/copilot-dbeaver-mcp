@@ -50,3 +50,25 @@ jobs:
 
       - name: Run Unit & End-to-End Test Suite
         run: python -m unittest discover -s tests -v
+
+  test-no-jdk-python-engine:
+    name: Zero-JDK Pure-Python Fallback Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12 (without Java)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install package
+        run: python -m pip install -e .
+
+      - name: Verify pure-Python fallback doctor & E2E tests
+        env:
+          COPILOT_DBEAVER_ENGINE: python
+        run: |
+          copilot-dbeaver-mcp --doctor
+          python -m unittest tests/test_sql_guard.py tests/test_v2_features.py -v

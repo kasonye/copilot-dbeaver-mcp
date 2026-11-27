@@ -36,6 +36,10 @@
    - `diff_schema` 现已包含**唯一索引与联合索引（Indexes）比对**，自动生成缺失的 `CREATE [UNIQUE] INDEX` 同步补丁。
    - 完整实现 MCP 原生 **Prompts**（内置 `/diagnose-db-error`、`/check-schema-diff`、`/design-ddl-migration`、`/cleanup-or-rollback` 四个专家工作流模板）与 **Resources**（`dbguard://connections`、`dbguard://audit-ledger`、`dbguard://policy-config`）。
    - 支持 `backup_retention_days: 30` 自动清理超期未脱敏冷备目录（永久保留已脱敏的审计台账），并兼容 DBeaver 自定义主密码（`COPILOT_DBEAVER_MASTER_PASSWORD`）及默认 `~/.ssh/` 私钥自动探测。
+9. **v2.0 架构跃迁：外键图谱一键追踪 + 死锁/长事务现场诊断 + 无 JDK 双引擎自适应**
+   - `trace_record_graph`：同时识别物理外键与企业常见的 `*_id` 隐式关联命名，**一次调用直接抓回「父表记录 + 主记录 + 关联子表记录摘要」（全脱敏）**，并自动检测标记 `ORPHAN_FOREIGN_KEY`（孤儿外键断链）。
+   - `diagnose_locks_and_blocking`：跨库只读检查 `innodb_trx` / `data_lock_waits`、`pg_stat_activity`、`v$locked_object` 等视图，快速揪出未提交事务（如忘记点 Commit 的 DBeaver 窗口）与锁等待阻塞源。
+   - **双引擎自适应（`JdbcBridge` + `PythonDbBridge`）**：有 JDK 时自动启用全能 JDBC 引擎；未安装 Java 的纯 Python / 前端 / Node 开发者机器上，自动无缝降级至纯 Python 引擎（内置零依赖纯标准库 AES 凭据解密器，原生支持 SQLite 及可选 `PyMySQL` / `psycopg`）。
 
 ---
 
