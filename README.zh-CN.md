@@ -32,6 +32,10 @@
    - `diff_schema`：单连接批量拉取元数据，秒级对比两个环境（如 `localhost` 与 `SIT/UAT`）之间的缺失表、缺失列、字段类型差异，并自动生成对应数据库方言的增量 `ALTER/CREATE` 补丁脚本。
    - `rollback_by_change_id`：传入历史记录中的 `change_id`，本机开发库一键原子执行逆向恢复或清空测试造数，远程库直接弹出对应的 `rollback.sql` 到 DBeaver。
    - **递归 JSON 隐私脱敏 + 空闲自动回收连接池**：支持对大字段 JSON 内部嵌套的敏感驼峰键值（如 `mobilePhone`、`idCard`）自动递归掩码；内置 3 分钟空闲自动断连连接池与凭据缓存，大幅加速远程库与 SSH 隧道库连续查询。
+8. **全维度精进（v1.3 新增：索引比对 + 原生斜杠指令 + 冷备生命周期清理 + 主密码兼容）**
+   - `diff_schema` 现已包含**唯一索引与联合索引（Indexes）比对**，自动生成缺失的 `CREATE [UNIQUE] INDEX` 同步补丁。
+   - 完整实现 MCP 原生 **Prompts**（内置 `/diagnose-db-error`、`/check-schema-diff`、`/design-ddl-migration`、`/cleanup-or-rollback` 四个专家工作流模板）与 **Resources**（`dbguard://connections`、`dbguard://audit-ledger`、`dbguard://policy-config`）。
+   - 支持 `backup_retention_days: 30` 自动清理超期未脱敏冷备目录（永久保留已脱敏的审计台账），并兼容 DBeaver 自定义主密码（`COPILOT_DBEAVER_MASTER_PASSWORD`）及默认 `~/.ssh/` 私钥自动探测。
 
 ---
 

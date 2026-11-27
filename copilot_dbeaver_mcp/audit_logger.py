@@ -17,6 +17,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import re
+import shutil
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -302,6 +303,28 @@ class ModificationAuditor:
             if str(entry.get("change_id")) == target:
                 return entry
         return None
+
+    def purge_expired_backups(self, retention_days: int = 30) -> int:
+        """
+        Deletes unmasked backup date-folders older than retention_days to enforce
+        local data-minimization hygiene, while permanently keeping the PII-masked
+        modification_audit.md and modification_audit.jsonl ledgers.
+        """
+        if retention_days <= 0 or not self.backup_root.is_dir():
+            return 0
+        today = dt.date.today()
+        purged = 0
+        for child in list(self.backup_root.iterdir()):
+            if not child.is_dir():
+                continue
+            try:
+                folder_date = dt.date.fromisoformat(child.name)
+            except ValueError:
+                continue
+            if (today - folder_date).days > retention_days:
+                shutil.rmtree(child, ignore_errors=True)
+                purged += 1
+        return purged
 
     def record_ddl_migration_backup_and_log(
         self,

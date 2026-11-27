@@ -15,16 +15,18 @@ It is purpose-built for **both daily feature development and production-grade in
 
 ## Key Features
 
-- **Zero-Password DBeaver Reuse (Including SSH Tunnels)**
-  Automatically discovers connections, cached JDBC drivers, and SSH tunnels from your local DBeaver workspace (`workspace6`). Credentials are decrypted **strictly in JVM memory** — never written to config files, logs, or exposed to the LLM.
+- **Zero-Password DBeaver Reuse (Including SSH Tunnels & Custom Master Passwords)**
+  Automatically discovers connections, cached JDBC drivers, and SSH tunnels (including `~/.ssh/` default private keys) from your local DBeaver workspace (`workspace6`). Supports custom DBeaver Master Passwords via `COPILOT_DBEAVER_MASTER_PASSWORD`. Credentials are decrypted **strictly in JVM memory**.
 - **Protocol & Engine-Level Read-Only Lock**
   Diagnostic tools (`diagnose_query`, `inspect_schema`, `explain_query`) strip multi-statement flags (`allowMultiQueries=false`), enforce `Connection.setReadOnly(true)` + `SET SESSION TRANSACTION READ ONLY` (`SET TRANSACTION READ ONLY` on Oracle), apply query timeouts and row caps, and always `ROLLBACK` on close.
 - **Anomaly-Preserving Dynamic PII Masking**
   Automatically masks sensitive columns and values (IDs, names, phones, emails, secrets) before returning results to cloud LLMs — while preserving **`NULL` vs empty string `""`, character length, and leading/trailing whitespace** (`J***h [MASKED:PII len=12 trail_ws=2]`) so AI can still spot data corruption!
 - **Rolled-Back Transactional Previews (`preview_remediation`)**
   Tests `UPDATE / DELETE / INSERT` fixes inside a real database transaction (`START TRANSACTION` $\rightarrow$ pre-`SELECT` $\rightarrow$ DML $\rightarrow$ post-`SELECT` $\rightarrow$ **`ROLLBACK`**), verifying constraints and returning exact row diffs with zero persistence.
-- **Fail-Closed "No Backup, No Modification" & Dual Audit Ledger**
-  Every modification — whether handed off to DBeaver (`open_remediation_in_dbeaver`) or committed locally (`apply_remediation`) — **must** first persist three backup artifacts (`backup_record.json`, `before_rows_insert.sql`, and primary-key-accurate `rollback.sql`) and append to `modification_audit.md` & `modification_audit.jsonl`.
+- **Fail-Closed "No Backup, No Modification", Dual Audit Ledger & Auto-Retention**
+  Every modification — whether handed off to DBeaver (`open_remediation_in_dbeaver`) or committed locally (`apply_remediation`) — **must** first persist three backup artifacts (`backup_record.json`, `before_rows_insert.sql`, and primary-key-accurate `rollback.sql`) and append to `modification_audit.md` & `modification_audit.jsonl`. Unmasked backups older than `backup_retention_days` (default `30` days) are automatically purged while keeping the PII-masked audit ledger.
+- **Native MCP Prompts & Resources**
+  Includes built-in slash workflow prompts (`diagnose-db-error`, `check-schema-diff`, `design-ddl-migration`, `cleanup-or-rollback`) and live read-only resources (`dbguard://connections`, `dbguard://audit-ledger`, `dbguard://policy-config`).
 
 ---
 

@@ -12,6 +12,7 @@ import java.net.URL;
 import java.net.URLClassLoader;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.security.MessageDigest;
 import java.sql.Connection;
 import java.sql.DatabaseMetaData;
 import java.sql.Driver;
@@ -372,13 +373,42 @@ public class JdbcBridge {
         }
         byte[] iv = Arrays.copyOfRange(raw, 0, 16);
         byte[] cipherBytes = Arrays.copyOfRange(raw, 16, raw.length);
-        Cipher cipher = Cipher.getInstance("AES/CBC/PKCS5Padding");
-        cipher.init(
-                Cipher.DECRYPT_MODE,
-                new SecretKeySpec(DBEAVER_LOCAL_KEY, "AES"),
-                new IvParameterSpec(iv));
-        byte[] plain = cipher.doFinal(cipherBytes);
-        String jsonText = new String(plain, StandardCharsets.UTF_8).trim();
+
+        List<byte[]> candidateKeys = new ArrayList<>();
+        String customMaster = System.getenv("COPILOT_DBEAVER_MASTER_PASSWORD");
+        if (customMaster != null && !customMaster.isEmpty()) {
+            byte[] pwBytes = customMaster.getBytes(StandardCharsets.UTF_8);
+            candidateKeys.add(MessageDigest.getInstance("MD5").digest(pwBytes));
+            byte[] sha256 = MessageDigest.getInstance("SHA-256").digest(pwBytes);
+            candidateKeys.add(Arrays.copyOf(sha256, 16));
+        }
+        candidateKeys.add(DBEAVER_LOCAL_KEY);
+
+        String jsonText = null;
+        Exception lastErr = null;
+        for (byte[] keyBytes : candidateKeys) {
+            try {
+                Cipher cipher = Cipher.getInstance("AES/CBC/PKCS5Padding");
+                cipher.init(Cipher.DECRYPT_MODE, new SecretKeySpec(keyBytes, "AES"), new IvParameterSpec(iv));
+                byte[] plain = cipher.doFinal(cipherBytes);
+                String candidate = new String(plain, StandardCharsets.UTF_8).trim();
+                if (!candidate.isEmpty() && candidate.charAt(0) == '\uFEFF') {
+                    candidate = candidate.substring(1).trim();
+                }
+                if (candidate.startsWith("{")) {
+                    jsonText = candidate;
+                    break;
+                }
+            } catch (Exception e) {
+                lastErr = e;
+            }
+        }
+        if (jsonText == null) {
+            throw new IllegalStateException(
+                    "Failed to decrypt DBeaver credentials-config.json. If you configured a custom Master Password in DBeaver, set env COPILOT_DBEAVER_MASTER_PASSWORD.",
+                    lastErr);
+        }
+
         Object parsed = new MiniJsonParser(jsonText).parseValue();
         if (parsed instanceof Map<?, ?> m) {
             Map<String, Object> map = (Map<String, Object>) m;
@@ -386,6 +416,26 @@ public class JdbcBridge {
             return map;
         }
         return Map.of();
+    }
+
+    private static String resolveSshPrivateKeyPath(String configuredPath) {
+        if (configuredPath != null && !configuredPath.isEmpty()) {
+            File f = new File(configuredPath);
+            if (f.isFile()) {
+                return f.getAbsolutePath();
+            }
+        }
+        String home = System.getProperty("user.home");
+        if (home != null && !home.isEmpty()) {
+            File sshDir = new File(home, ".ssh");
+            for (String keyName : new String[] {"id_ed25519", "id_ecdsa", "id_rsa"}) {
+                File candidate = new File(sshDir, keyName);
+                if (candidate.isFile()) {
+                    return candidate.getAbsolutePath();
+                }
+            }
+        }
+        return "";
     }
 
     private static int ensureSshTunnel(
@@ -427,10 +477,13 @@ public class JdbcBridge {
             sshClientCls.getMethod("addHostKeyVerifier", hostVerifierIntf).invoke(ssh, verifier);
             sshClientCls.getMethod("connect", String.class, int.class).invoke(ssh, bastionHost, bastionPort);
 
-            if ("PUBLIC_KEY".equalsIgnoreCase(authType) && privateKeyPath != null && !privateKeyPath.isEmpty()) {
+            String resolvedKeyPath = resolveSshPrivateKeyPath(privateKeyPath);
+            boolean usePubKey = "PUBLIC_KEY".equalsIgnoreCase(authType)
+                    || ((sshPass == null || sshPass.isEmpty()) && !resolvedKeyPath.isEmpty());
+            if (usePubKey && !resolvedKeyPath.isEmpty()) {
                 if (sshPass != null && !sshPass.isEmpty()) {
                     Object kp = sshClientCls.getMethod("loadKeys", String.class, String.class)
-                            .invoke(ssh, privateKeyPath, sshPass);
+                            .invoke(ssh, resolvedKeyPath, sshPass);
                     Class<?> kpArrCls = Class.forName(
                             "[Lnet.schmizz.sshj.userauth.keyprovider.KeyProvider;", true, PLUGIN_LOADER);
                     Object arr = java.lang.reflect.Array.newInstance(kpArrCls.getComponentType(), 1);
@@ -438,7 +491,7 @@ public class JdbcBridge {
                     sshClientCls.getMethod("authPublickey", String.class, kpArrCls).invoke(ssh, sshUser, arr);
                 } else {
                     sshClientCls.getMethod("authPublickey", String.class, String[].class)
-                            .invoke(ssh, sshUser, (Object) new String[] {privateKeyPath});
+                            .invoke(ssh, sshUser, (Object) new String[] {resolvedKeyPath});
                 }
             } else {
                 sshClientCls.getMethod("authPassword", String.class, String.class)
@@ -866,6 +919,8 @@ public class JdbcBridge {
                     }
                     sb.append(']');
 
+                    sb.append(",\"indexes\":").append(readTableIndexesJson(meta, catalog, schemaPattern, tableTarget));
+
                     String ddl = null;
                     String lower = jdbcUrl.toLowerCase();
                     if ((lower.startsWith("jdbc:mysql:") || lower.startsWith("jdbc:mariadb:"))
@@ -1078,7 +1133,8 @@ public class JdbcBridge {
                         if (i > 0) sb.append(',');
                         sb.append(jsonStr(pks.get(i)));
                     }
-                    sb.append("],\"columns\":[");
+                    sb.append("],\"indexes\":").append(readTableIndexesJson(meta, catalog, schemaPat, tName));
+                    sb.append(",\"columns\":[");
                     List<Map<String, Object>> cols = entry.getValue();
                     for (int i = 0; i < cols.size(); i++) {
                         if (i > 0) sb.append(',');
@@ -1238,6 +1294,46 @@ public class JdbcBridge {
                 }
             }
         }
+    }
+
+    private static String readTableIndexesJson(
+            DatabaseMetaData meta, String catalog, String schemaPat, String tableName) {
+        Map<String, Boolean> idxUnique = new LinkedHashMap<>();
+        Map<String, List<String>> idxCols = new LinkedHashMap<>();
+        try (ResultSet rs = meta.getIndexInfo(catalog, schemaPat, tableName, false, true)) {
+            while (rs.next()) {
+                String idxName = rs.getString("INDEX_NAME");
+                String colName = rs.getString("COLUMN_NAME");
+                if (idxName == null || colName == null) {
+                    continue;
+                }
+                String upper = idxName.toUpperCase();
+                if ("PRIMARY".equals(upper) || upper.startsWith("PRIMARY_KEY_") || upper.startsWith("SYS_IDX_PK_")) {
+                    continue;
+                }
+                boolean unique = !rs.getBoolean("NON_UNIQUE");
+                idxUnique.putIfAbsent(idxName, unique);
+                idxCols.computeIfAbsent(idxName, k -> new ArrayList<>()).add(colName);
+            }
+        } catch (SQLException ignored) {
+        }
+        StringBuilder sb = new StringBuilder("[");
+        int i = 0;
+        for (Map.Entry<String, List<String>> e : idxCols.entrySet()) {
+            if (i++ > 0) sb.append(',');
+            String name = e.getKey();
+            sb.append("{\"name\":").append(jsonStr(name))
+              .append(",\"unique\":").append(Boolean.TRUE.equals(idxUnique.get(name)))
+              .append(",\"columns\":[");
+            List<String> cols = e.getValue();
+            for (int j = 0; j < cols.size(); j++) {
+                if (j > 0) sb.append(',');
+                sb.append(jsonStr(cols.get(j)));
+            }
+            sb.append("]}");
+        }
+        sb.append(']');
+        return sb.toString();
     }
 
     private static final class QuerySnapshot {

@@ -264,6 +264,7 @@ class DbGuardApp:
 
         self.remediation_dir = self.storage_root / "remediations"
         self._jdbc: Optional[JdbcBridgeProcess] = None
+        self._retention_purged_done = False
         self.reload_config()
 
     def reload_config(self) -> None:
@@ -286,6 +287,7 @@ class DbGuardApp:
         self.hard_max_rows = int(sec.get("hard_max_rows", 500))
         self.max_write_rows = int(sec.get("max_write_rows", 20))
         self.max_seed_rows = int(sec.get("max_seed_rows", 50))
+        self.backup_retention_days = int(sec.get("backup_retention_days", 30))
         allow_list = sec.get("allow_direct_apply_connections")
         if allow_list is None:
             allow_list = ["localhost", "127.0.0.1"]
@@ -297,6 +299,12 @@ class DbGuardApp:
             exempt_columns=sec.get("exempt_columns"),
         )
         self.auditor = ModificationAuditor(base_dir=self.storage_root, masker=self.masker)
+        if not self._retention_purged_done:
+            self._retention_purged_done = True
+            try:
+                self.auditor.purge_expired_backups(self.backup_retention_days)
+            except Exception:
+                pass
 
         dbeaver_cfg = raw.get("dbeaver") or {}
         self.dbeaver_exe = dbeaver_cfg.get("executable_path") or None
@@ -1851,6 +1859,65 @@ TOOLS_MANIFEST: List[Dict[str, Any]] = [
 ]
 
 
+PROMPTS_MANIFEST: List[Dict[str, Any]] = [
+    {
+        "name": "diagnose-db-error",
+        "description": "Correlate application error logs + domain entities + live read-only DB queries to pinpoint corrupted records and preview a safe fix.",
+        "arguments": [
+            {"name": "connection", "description": "DBeaver connection name (optional).", "required": False},
+            {"name": "database", "description": "Target database/schema name (optional).", "required": False},
+            {"name": "symptom", "description": "Error message, business key, or symptom (optional).", "required": False},
+        ],
+    },
+    {
+        "name": "check-schema-diff",
+        "description": "Compare tables, columns, primary keys, and indexes between two environments (e.g. local dev vs staging/SIT) and generate sync DDL.",
+        "arguments": [
+            {"name": "source_connection", "description": "Reference DBeaver connection (e.g. localhost).", "required": True},
+            {"name": "target_connection", "description": "Target DBeaver connection to compare against.", "required": True},
+            {"name": "database", "description": "Database/schema name if shared.", "required": False},
+        ],
+    },
+    {
+        "name": "design-ddl-migration",
+        "description": "Inspect existing table conventions, draft forward + reverse rollback DDL, snapshot schema, and open in DBeaver.",
+        "arguments": [
+            {"name": "table", "description": "Target table name.", "required": True},
+            {"name": "requirement", "description": "Schema change requirement.", "required": True},
+            {"name": "connection", "description": "DBeaver connection name (optional).", "required": False},
+        ],
+    },
+    {
+        "name": "cleanup-or-rollback",
+        "description": "Inspect recent database modification history and atomically roll back or clean up seeded test data by change_id.",
+        "arguments": [
+            {"name": "change_id", "description": "Specific change_id to roll back (optional; lists history first if omitted).", "required": False},
+        ],
+    },
+]
+
+RESOURCES_MANIFEST: List[Dict[str, Any]] = [
+    {
+        "uri": "dbguard://connections",
+        "name": "DBeaver Discovered Connections",
+        "description": "Live list of auto-discovered DBeaver database connections, drivers, and SSH tunnel flags (no secrets).",
+        "mimeType": "application/json",
+    },
+    {
+        "uri": "dbguard://audit-ledger",
+        "name": "Database Modification Audit Ledger",
+        "description": "Chronological Markdown audit log of all database remediations, DDL migrations, test seeds, and rollbacks (PII-masked).",
+        "mimeType": "text/markdown",
+    },
+    {
+        "uri": "dbguard://policy-config",
+        "name": "Active Security & Retention Policy",
+        "description": "Current query timeout, row circuit breakers, backup retention days, and direct-apply connection allowlist.",
+        "mimeType": "application/json",
+    },
+]
+
+
 class McpStdioServer:
     def __init__(self, app: DbGuardApp) -> None:
         self.app = app
@@ -1887,7 +1954,11 @@ class McpStdioServer:
                 "id": msg_id,
                 "result": {
                     "protocolVersion": negotiated,
-                    "capabilities": {"tools": {"listChanged": False}},
+                    "capabilities": {
+                        "tools": {"listChanged": False},
+                        "prompts": {"listChanged": False},
+                        "resources": {"subscribe": False, "listChanged": False},
+                    },
                     "serverInfo": {"name": "copilot-dbeaver-mcp", "version": __version__},
                 },
             }
@@ -1940,15 +2011,118 @@ class McpStdioServer:
                     },
                 }
 
-        if method in {"resources/list", "prompts/list"}:
-            key = "resources" if method == "resources/list" else "prompts"
-            return {"jsonrpc": "2.0", "id": msg_id, "result": {key: []}}
+        if method == "prompts/list":
+            return {"jsonrpc": "2.0", "id": msg_id, "result": {"prompts": PROMPTS_MANIFEST}}
+
+        if method == "prompts/get":
+            pname = params.get("name", "")
+            pargs = params.get("arguments") or {}
+            prompt_text = self._render_prompt(pname, pargs)
+            if prompt_text is None:
+                return {
+                    "jsonrpc": "2.0",
+                    "id": msg_id,
+                    "error": {"code": -32602, "message": f"Unknown prompt: {pname}"},
+                }
+            return {
+                "jsonrpc": "2.0",
+                "id": msg_id,
+                "result": {
+                    "description": f"Workflow prompt for {pname}",
+                    "messages": [
+                        {"role": "user", "content": {"type": "text", "text": prompt_text}}
+                    ],
+                },
+            }
+
+        if method == "resources/list":
+            return {"jsonrpc": "2.0", "id": msg_id, "result": {"resources": RESOURCES_MANIFEST}}
+
+        if method == "resources/read":
+            uri = str(params.get("uri") or "")
+            res_content = self._read_resource(uri)
+            if res_content is None:
+                return {
+                    "jsonrpc": "2.0",
+                    "id": msg_id,
+                    "error": {"code": -32602, "message": f"Unknown resource URI: {uri}"},
+                }
+            mime, text_val = res_content
+            return {
+                "jsonrpc": "2.0",
+                "id": msg_id,
+                "result": {
+                    "contents": [{"uri": uri, "mimeType": mime, "text": text_val}]
+                },
+            }
 
         return {
             "jsonrpc": "2.0",
             "id": msg_id,
             "error": {"code": -32601, "message": f"Method not found: {method}"},
         }
+
+    def _render_prompt(self, name: str, args: Dict[str, Any]) -> Optional[str]:
+        if name == "diagnose-db-error":
+            conn = args.get("connection") or "(default)"
+            db = args.get("database") or "(infer from project config or list_databases)"
+            sym = args.get("symptom") or "recent database/data exception in logs"
+            return (
+                f"Investigate '{sym}' using connection={conn}, database={db}:\n"
+                "1. Call scan_recent_db_errors_in_logs and inspect the matching domain Entity/Service code.\n"
+                "2. Call inspect_schema and diagnose_query (read-only, PII-masked) to pinpoint exact dirty rows by primary key.\n"
+                "3. Run preview_remediation (rolled-back dry-run) to verify the fix diff, then present the root cause and offer open_remediation_in_dbeaver or apply_remediation."
+            )
+        if name == "check-schema-diff":
+            src = args.get("source_connection", "localhost")
+            dst = args.get("target_connection", "")
+            db = args.get("database", "")
+            return (
+                f"Compare database schemas between source_connection='{src}' and target_connection='{dst}'"
+                + (f" (database='{db}')" if db else "")
+                + ":\n1. Call diff_schema to inspect missing tables, column type/nullability mismatches, and missing indexes.\n"
+                "2. Cross-check against domain Entity classes in this workspace and summarize actionable DDL sync patches."
+            )
+        if name == "design-ddl-migration":
+            tbl = args.get("table", "")
+            req = args.get("requirement", "")
+            conn = args.get("connection") or "localhost"
+            return (
+                f"Design a safe schema migration on table '{tbl}' (connection='{conn}') for: {req}\n"
+                "1. Call inspect_schema first to match naming conventions, column types, and existing indexes.\n"
+                "2. Draft both forward DDL and reverse rollback_ddl_sql, then call open_ddl_migration_in_dbeaver so the current DDL is snapshotted and opened in DBeaver for review."
+            )
+        if name == "cleanup-or-rollback":
+            cid = args.get("change_id") or ""
+            if cid:
+                return f"Roll back change_id='{cid}' using rollback_by_change_id and verify post-rollback row state via diagnose_query."
+            return "Call list_modification_history to display recent database modifications and ask which change_id to roll back via rollback_by_change_id."
+        return None
+
+    def _read_resource(self, uri: str) -> Optional[tuple[str, str]]:
+        self.app.reload_config()
+        if uri == "dbguard://connections":
+            data = self.app.tool_list_connections({})
+            return "application/json", json.dumps(data, ensure_ascii=False, indent=2)
+        if uri == "dbguard://audit-ledger":
+            md_path = self.app.auditor.md_log_path
+            if md_path.is_file():
+                return "text/markdown", md_path.read_text(encoding="utf-8")
+            return "text/markdown", "# No database modifications recorded yet.\n"
+        if uri == "dbguard://policy-config":
+            policy = {
+                "default_connection": self.app.default_connection,
+                "default_database": self.app.default_database,
+                "query_timeout_sec": self.app.query_timeout_sec,
+                "default_max_rows": self.app.default_max_rows,
+                "hard_max_rows": self.app.hard_max_rows,
+                "max_write_rows": self.app.max_write_rows,
+                "max_seed_rows": self.app.max_seed_rows,
+                "backup_retention_days": self.app.backup_retention_days,
+                "allow_direct_apply_connections": sorted(self.app.allow_direct_apply_set),
+            }
+            return "application/json", json.dumps(policy, ensure_ascii=False, indent=2)
+        return None
 
     def serve_forever(self) -> None:
         stdin_bin = sys.stdin.buffer

@@ -110,7 +110,41 @@ def compute_schema_diff(
         tgt_pks = sorted(p.lower() for p in (tgt_meta.get("primaryKeys") or []))
         pk_mismatch = (src_pks != tgt_pks)
 
-        if missing_cols or extra_cols or mismatched_cols or pk_mismatch:
+        # Semantic index comparison by (unique, ordered_lowercase_columns)
+        src_indexes = src_meta.get("indexes") or []
+        tgt_indexes = tgt_meta.get("indexes") or []
+        src_idx_by_sig = {
+            (bool(ix.get("unique")), tuple(str(c).lower() for c in (ix.get("columns") or []))): ix
+            for ix in src_indexes
+            if ix.get("columns")
+        }
+        tgt_idx_by_sig = {
+            (bool(ix.get("unique")), tuple(str(c).lower() for c in (ix.get("columns") or []))): ix
+            for ix in tgt_indexes
+            if ix.get("columns")
+        }
+
+        missing_indexes: List[Dict[str, Any]] = []
+        extra_indexes: List[Dict[str, Any]] = []
+
+        for sig, six in src_idx_by_sig.items():
+            if sig not in tgt_idx_by_sig:
+                missing_indexes.append(six)
+                idx_name = str(six.get("name") or f"idx_{tgt_tname}_{'_'.join(six['columns'])}")
+                q_idx = quote_ident(idx_name, target_dialect)
+                q_cols = ", ".join(quote_ident(str(c), target_dialect) for c in six["columns"])
+                uniq_kw = "UNIQUE " if six.get("unique") else ""
+                suggested_ddl.append(f"CREATE {uniq_kw}INDEX {q_idx} ON {qt} ({q_cols});")
+                if target_dialect in {"mysql", "mssql"}:
+                    reverse_rollback_ddl.append(f"DROP INDEX {q_idx} ON {qt};")
+                else:
+                    reverse_rollback_ddl.append(f"DROP INDEX {q_idx};")
+
+        for sig, tix in tgt_idx_by_sig.items():
+            if sig not in src_idx_by_sig:
+                extra_indexes.append(tix)
+
+        if missing_cols or extra_cols or mismatched_cols or pk_mismatch or missing_indexes or extra_indexes:
             table_diffs.append(
                 {
                     "table": tgt_tname,
@@ -122,6 +156,8 @@ def compute_schema_diff(
                         if pk_mismatch
                         else None
                     ),
+                    "missing_indexes_in_target": missing_indexes,
+                    "extra_indexes_in_target": extra_indexes,
                 }
             )
 

@@ -23,6 +23,8 @@ security:
   max_write_rows: 20
   # Maximum synthetic test rows a single seed_dev_test_data call may insert on allowed dev DBs
   max_seed_rows: 50
+  # Auto-purge unmasked local backup folders older than N days (0 = keep forever; masked audit ledger is always kept)
+  backup_retention_days: 30
   # Mask PII columns (IDs, names, phones, emails, secrets) while preserving length & whitespace anomalies
   mask_sensitive_data: true
   extra_sensitive_column_patterns: []

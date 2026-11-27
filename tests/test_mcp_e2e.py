@@ -108,6 +108,7 @@ class McpEndToEndTests(unittest.TestCase):
             "customer_name VARCHAR(64), "
             "national_id VARCHAR(32)"
             ")\\;"
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_customer_orders_code ON customer_orders(order_code)\\;"
             "CREATE TABLE IF NOT EXISTS order_audit_events ("
             "event_id INT PRIMARY KEY, "
             "event_type VARCHAR(32) NOT NULL"
@@ -194,6 +195,11 @@ class McpEndToEndTests(unittest.TestCase):
         )
 
         storage_dir = self.tmp_dir / "storage"
+        # Seed an expired 2020-01-01 backup directory to verify auto-retention cleanup on startup!
+        expired_bkp = storage_dir / "audit-backups" / "2020-01-01" / "old_bundle"
+        expired_bkp.mkdir(parents=True, exist_ok=True)
+        (expired_bkp / "backup_record.json").write_text("{}", encoding="utf-8")
+
         cfg_file = self.tmp_dir / "config.yaml"
         cfg_file.write_text(
             f"""
@@ -483,9 +489,39 @@ dbeaver:
             self.assertIn("order_audit_events", [t.lower() for t in sdiff["missing_tables_in_target"]])
             self.assertTrue(any("ADD COLUMN" in d for d in sdiff["suggested_sync_ddl"]))
             self.assertTrue(any("CREATE TABLE" in d for d in sdiff["suggested_sync_ddl"]))
+            self.assertTrue(any("CREATE UNIQUE INDEX" in d for d in sdiff["suggested_sync_ddl"]))
 
-            # 8. Verify audit ledger masks PII while tracking all 7 operations
-            is_err, hist = call_tool(proc, 18, "list_modification_history", {"limit": 20})
+            # 8. Test MCP native Prompts & Resources + backup_retention_days auto-purge
+            self.assertFalse((storage_dir / "audit-backups" / "2020-01-01").exists())
+
+            prompts_resp = send_rpc(proc, {"jsonrpc": "2.0", "id": 18, "method": "prompts/list"})
+            self.assertEqual(len(prompts_resp["result"]["prompts"]), 4)
+            pget_resp = send_rpc(
+                proc,
+                {
+                    "jsonrpc": "2.0",
+                    "id": 19,
+                    "method": "prompts/get",
+                    "params": {"name": "diagnose-db-error", "arguments": {"symptom": "NullPointerException"}},
+                },
+            )
+            self.assertIn("NullPointerException", pget_resp["result"]["messages"][0]["content"]["text"])
+
+            res_list = send_rpc(proc, {"jsonrpc": "2.0", "id": 20, "method": "resources/list"})
+            self.assertEqual(len(res_list["result"]["resources"]), 3)
+            res_read = send_rpc(
+                proc,
+                {
+                    "jsonrpc": "2.0",
+                    "id": 21,
+                    "method": "resources/read",
+                    "params": {"uri": "dbguard://audit-ledger"},
+                },
+            )
+            self.assertIn("COMMITTED", res_read["result"]["contents"][0]["text"])
+
+            # 9. Verify audit ledger masks PII while tracking all 7 operations
+            is_err, hist = call_tool(proc, 22, "list_modification_history", {"limit": 20})
             self.assertFalse(is_err, hist)
             self.assertEqual(hist["total_entries"], 7)
             md_ledger = Path(hist["audit_markdown_path"]).read_text(encoding="utf-8")
