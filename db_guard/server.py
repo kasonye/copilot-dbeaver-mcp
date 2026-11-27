@@ -26,11 +26,15 @@ from db_guard.dbeaver_bridge import (
     launch_script_in_dbeaver,
     load_dbeaver_connections,
     scan_db_errors_in_logs,
+    write_dbeaver_ddl_migration_script,
     write_dbeaver_remediation_script,
 )
 from db_guard.sql_guard import (
     DynamicDataMasker,
     build_rollback_sql,
+    build_seed_batch_sql,
+    validate_ddl_migration_sql,
+    validate_identifier,
     validate_readonly_sql,
     validate_remediation_sql,
 )
@@ -274,6 +278,7 @@ class DbGuardApp:
         self.default_max_rows = int(sec.get("default_max_rows", 100))
         self.hard_max_rows = int(sec.get("hard_max_rows", 500))
         self.max_write_rows = int(sec.get("max_write_rows", 20))
+        self.max_seed_rows = int(sec.get("max_seed_rows", 50))
         allow_list = sec.get("allow_direct_apply_connections")
         if allow_list is None:
             allow_list = ["localhost", "127.0.0.1"]
@@ -1029,6 +1034,259 @@ class DbGuardApp:
             table_filter=args.get("table"),
         )
 
+    def tool_open_ddl_migration_in_dbeaver(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Safe Schema Migration Assistant:
+        Validates forward DDL (blocks catastrophic DROP TABLE/DATABASE/TRUNCATE), snapshots
+        existing table schema/DDL, saves paired reverse rollback DDL, optionally writes a
+        project Flyway/Liquibase file, logs to audit ledger, and opens in DBeaver for human review.
+        """
+        self.reload_config()
+        tgt = self._resolve_target(
+            args.get("connection") or args.get("profile"), args.get("database")
+        )
+        table = (args.get("table") or "").strip()
+        id_err = validate_identifier(table, "table")
+        if id_err:
+            raise ValueError(id_err)
+
+        ddl_sql = (args.get("ddl_sql") or "").strip()
+        rollback_ddl_sql = (args.get("rollback_ddl_sql") or "").strip()
+        if not rollback_ddl_sql:
+            raise ValueError(
+                "rollback_ddl_sql is mandatory for open_ddl_migration_in_dbeaver "
+                "(e.g. 'DROP TABLE IF EXISTS new_table;' or 'ALTER TABLE t DROP COLUMN added_col;')."
+            )
+
+        migration_title = (args.get("migration_title") or f"Schema migration on {table}").strip()
+        ddl_stmts, warnings, ddl_err = validate_ddl_migration_sql(ddl_sql)
+        if ddl_err:
+            raise ValueError(f"DDL Guardrail Blocked Migration: {ddl_err}")
+
+        # Capture read-only snapshot of current table metadata/DDL before migration
+        short_table = table.split(".")[-1]
+        schema_snap: Dict[str, Any] = {}
+        try:
+            sres = self.jdbc.request(
+                mode="SCHEMA",
+                jdbc_url=tgt.jdbc_url,
+                user_spec=tgt.user_spec,
+                pass_spec=tgt.pass_spec,
+                target_db=tgt.target_db,
+                props_text=tgt.props_text,
+                timeout_sec=self.query_timeout_sec,
+                max_rows=100,
+                arg1=tgt.target_db,
+                arg2=short_table,
+            )
+            if sres.get("ok"):
+                sres.pop("id", None)
+                schema_snap = sres
+        except Exception:
+            schema_snap = {"note": "Could not inspect pre-existing table snapshot."}
+
+        backup_paths = self.auditor.record_ddl_migration_backup_and_log(
+            connection=tgt.display_name,
+            database=tgt.target_db,
+            table=table,
+            migration_title=migration_title,
+            ddl_sql=ddl_sql,
+            rollback_ddl_sql=rollback_ddl_sql,
+            existing_schema_snapshot=schema_snap,
+            warnings=warnings,
+        )
+
+        # Optionally write clean forward migration SQL file into the user's project (e.g. Flyway V2__*.sql)
+        written_migration_file: Optional[str] = None
+        mig_path_arg = (args.get("migration_file_path") or "").strip()
+        if mig_path_arg:
+            mp = Path(os.path.expanduser(os.path.expandvars(mig_path_arg))).resolve()
+            mp.parent.mkdir(parents=True, exist_ok=True)
+            header = f"-- Migration: {migration_title}\n-- Rollback : see {backup_paths['rollback_sql_path']}\n\n"
+            mp.write_text(
+                header + "\n\n".join(s.rstrip(";") + ";" for s in ddl_stmts) + "\n",
+                encoding="utf-8",
+            )
+            written_migration_file = str(mp)
+
+        script_path = write_dbeaver_ddl_migration_script(
+            output_dir=self.remediation_dir,
+            migration_title=migration_title,
+            table=table,
+            ddl_statements=ddl_stmts,
+            rollback_ddl_sql=rollback_ddl_sql,
+            warnings=warnings,
+            dbeaver_conn_name=tgt.dbeaver_conn_name,
+            database_name=tgt.target_db,
+            backup_bundle_dir=backup_paths["bundle_dir"],
+            project_migration_file=written_migration_file,
+        )
+
+        log_paths = self.auditor.record_audit_log(
+            change_id=backup_paths["change_id"],
+            channel="DBEAVER_DDL_HANDOFF",
+            status="DDL_SCRIPT_OPENED",
+            connection=tgt.display_name,
+            database=tgt.target_db,
+            table=table,
+            dml_verb="DDL",
+            where_clause="(schema migration)",
+            dml_sql="; ".join(s.strip() for s in ddl_stmts),
+            issue_summary=migration_title,
+            affected_rows=0,
+            columns=[],
+            primary_keys=[],
+            before_rows_unmasked=[],
+            after_rows_unmasked=[],
+            backup_paths=backup_paths,
+            dbeaver_script_path=str(script_path),
+        )
+
+        if bool(args.get("_skip_gui_for_test", False)):
+            launch_info: Dict[str, Any] = {
+                "launched": False,
+                "note": "GUI launch skipped for automated test",
+                "script_path": str(script_path),
+            }
+        else:
+            launch_info = launch_script_in_dbeaver(
+                script_path=script_path,
+                dbeaver_conn_name=tgt.dbeaver_conn_name,
+                dbeaver_exe=self.dbeaver_exe,
+            )
+
+        return {
+            **launch_info,
+            "change_id": backup_paths["change_id"],
+            "connection": tgt.display_name,
+            "database": tgt.target_db,
+            "warnings": warnings,
+            "project_migration_file": written_migration_file,
+            "schema_backup_dir": backup_paths["bundle_dir"],
+            "before_table_ddl_file": backup_paths["insert_sql_path"],
+            "rollback_ddl_file": backup_paths["rollback_sql_path"],
+            "audit_log_markdown": log_paths["audit_markdown_path"],
+        }
+
+    def tool_seed_dev_test_data(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Local-Dev-Only Synthetic Test Data Seeder:
+        Accepts structured row dicts (INSERT-only, immune to SQL injection), checks primary key
+        collisions beforehand so existing rows are never overwritten, commits atomically, and
+        generates a 1-click consolidated `DELETE ... WHERE pk IN (...)` cleanup backup & audit log.
+        """
+        self.reload_config()
+        tgt = self._resolve_target(
+            args.get("connection") or args.get("profile"),
+            args.get("database"),
+            for_write=True,
+        )
+        if not tgt.allow_direct_apply:
+            raise PermissionError(
+                f"seed_dev_test_data is strictly restricted to allowed development connections "
+                f"(rejected '{tgt.display_name}')."
+            )
+
+        table = (args.get("table") or "").strip()
+        rows = args.get("rows") or []
+        if not isinstance(rows, list):
+            raise ValueError("'rows' must be a JSON list of column->value objects.")
+        seed_summary = (args.get("seed_summary") or f"Seed {len(rows)} dev test row(s) into {table}").strip()
+        dry_run = bool(args.get("dry_run", False))
+
+        pks = self._fetch_primary_keys(tgt, table)
+        insert_stmts, verify_select_sql, cleanup_sql, build_err = build_seed_batch_sql(
+            table=table,
+            rows=rows,
+            primary_keys=pks,
+            max_seed_rows=self.max_seed_rows,
+            database=tgt.target_db,
+        )
+        if build_err:
+            raise ValueError(f"Seed Validation Error: {build_err}")
+
+        seed_res = self.jdbc.request(
+            mode="SEED",
+            jdbc_url=tgt.jdbc_url,
+            user_spec=tgt.user_spec,
+            pass_spec=tgt.pass_spec,
+            target_db=tgt.target_db,
+            props_text=tgt.props_text,
+            timeout_sec=self.query_timeout_sec,
+            max_rows=self.max_seed_rows,
+            dry_run=dry_run,
+            arg1=verify_select_sql,
+            arg2=json.dumps(insert_stmts, ensure_ascii=False),
+        )
+        if not seed_res.get("ok"):
+            raise RuntimeError(f"Seed batch failed and rolled back: {seed_res.get('error')}")
+
+        columns = seed_res.get("columns", [])
+        inserted_unmasked = seed_res.get("afterRows", [])
+        inserted_count = int(seed_res.get("insertedRows", len(inserted_unmasked)))
+        masked_rows, masked_cols = self.masker.mask_rows(columns, inserted_unmasked)
+
+        if dry_run:
+            return {
+                "connection": tgt.display_name,
+                "database": tgt.target_db,
+                "dry_run": True,
+                "committed": False,
+                "would_insert_rows": inserted_count,
+                "primary_keys": pks,
+                "masked_sensitive_columns": masked_cols,
+                "columns": columns,
+                "preview_rows": masked_rows,
+                "cleanup_sql_preview": cleanup_sql,
+            }
+
+        clean_where = verify_select_sql.split(" WHERE ", 1)[1]
+        backup_paths = self.auditor.create_seed_cleanup_backup(
+            connection=tgt.display_name,
+            database=tgt.target_db,
+            table=table,
+            seed_summary=seed_summary,
+            insert_statements=insert_stmts,
+            cleanup_rollback_sql=cleanup_sql,
+            columns=columns,
+            inserted_rows_unmasked=inserted_unmasked,
+        )
+        log_paths = self.auditor.record_audit_log(
+            change_id=backup_paths["change_id"],
+            channel="DEV_TEST_SEED",
+            status="COMMITTED",
+            connection=tgt.display_name,
+            database=tgt.target_db,
+            table=table,
+            dml_verb="SEED_INSERT",
+            where_clause=clean_where,
+            dml_sql=f"INSERT INTO {table} ... ({inserted_count} rows)",
+            issue_summary=seed_summary,
+            affected_rows=inserted_count,
+            columns=columns,
+            primary_keys=pks,
+            before_rows_unmasked=[],
+            after_rows_unmasked=inserted_unmasked,
+            backup_paths=backup_paths,
+        )
+
+        return {
+            "change_id": backup_paths["change_id"],
+            "connection": tgt.display_name,
+            "database": tgt.target_db,
+            "committed": True,
+            "inserted_rows": inserted_count,
+            "primary_keys": pks,
+            "cleanup_where_clause": clean_where,
+            "one_click_cleanup_dml": f"DELETE FROM {table} WHERE {clean_where}",
+            "masked_sensitive_columns": masked_cols,
+            "columns": columns,
+            "seeded_rows": masked_rows,
+            "backup_bundle_dir": backup_paths["bundle_dir"],
+            "cleanup_rollback_sql_path": backup_paths["rollback_sql_path"],
+            "audit_log_markdown": log_paths["audit_markdown_path"],
+        }
+
     def tool_scan_recent_db_errors_in_logs(self, args: Dict[str, Any]) -> Dict[str, Any]:
         return scan_db_errors_in_logs(
             project_dir=args.get("project_dir"),
@@ -1249,6 +1507,67 @@ TOOLS_MANIFEST: List[Dict[str, Any]] = [
         },
     },
     {
+        "name": "open_ddl_migration_in_dbeaver",
+        "description": (
+            "Safe Schema Migration Assistant: Validates CREATE TABLE / ALTER TABLE / CREATE|DROP INDEX "
+            "(blocks catastrophic DROP TABLE/DATABASE/TRUNCATE), snapshots existing table DDL to audit-backups/, "
+            "optionally writes a project migration file (e.g. Flyway), logs the migration, and opens a review script "
+            "with paired reverse rollback DDL in DBeaver for human execution."
+        ),
+        "annotations": {
+            "title": "Snapshot & Open DDL Migration in DBeaver",
+            "readOnlyHint": False,
+            "destructiveHint": False,
+            "idempotentHint": True,
+            "openWorldHint": True,
+        },
+        "inputSchema": {
+            "type": "object",
+            "required": ["table", "ddl_sql", "rollback_ddl_sql"],
+            "properties": {
+                **COMMON_TARGET_PROPS,
+                "migration_title": {"type": "string", "description": "Short summary of the schema change."},
+                "table": {"type": "string", "description": "Target table/view name."},
+                "ddl_sql": {"type": "string", "description": "Forward DDL statement(s) (CREATE TABLE / ALTER TABLE / CREATE INDEX)."},
+                "rollback_ddl_sql": {"type": "string", "description": "Reverse down-migration DDL to undo the schema change if needed."},
+                "migration_file_path": {
+                    "type": "string",
+                    "description": "Optional path in project (e.g. src/main/resources/db/migration/V2__add_col.sql) to also save the forward DDL.",
+                },
+            },
+        },
+    },
+    {
+        "name": "seed_dev_test_data",
+        "description": (
+            "Local-Dev-Only Synthetic Test Data Seeder: Atomically inserts structured test row objects (explicit primary keys required, "
+            "pre-checked against collisions so existing rows are never overwritten) on allowed local dev connections, and saves a "
+            "consolidated 1-click `DELETE ... WHERE pk IN (...)` cleanup script in audit-backups/."
+        ),
+        "annotations": {
+            "title": "Seed Dev Test Data (With 1-Click Cleanup)",
+            "readOnlyHint": False,
+            "destructiveHint": False,
+            "idempotentHint": False,
+            "openWorldHint": False,
+        },
+        "inputSchema": {
+            "type": "object",
+            "required": ["table", "rows"],
+            "properties": {
+                **COMMON_TARGET_PROPS,
+                "seed_summary": {"type": "string", "description": "Purpose of the seeded test dataset."},
+                "table": {"type": "string", "description": "Target table name."},
+                "rows": {
+                    "type": "array",
+                    "description": "List of column->value objects (must include primary key column(s)).",
+                    "items": {"type": "object"},
+                },
+                "dry_run": {"type": "boolean", "default": False, "description": "If true, validates constraints and rolls back without committing."},
+            },
+        },
+    },
+    {
         "name": "list_modification_history",
         "description": (
             "Lists chronological database modification audit logs, field diffs, original data backup paths, "
@@ -1285,6 +1604,8 @@ class McpStdioServer:
             "preview_remediation": self.app.tool_preview_remediation,
             "open_remediation_in_dbeaver": self.app.tool_open_remediation_in_dbeaver,
             "apply_remediation": self.app.tool_apply_remediation,
+            "open_ddl_migration_in_dbeaver": self.app.tool_open_ddl_migration_in_dbeaver,
+            "seed_dev_test_data": self.app.tool_seed_dev_test_data,
             "list_modification_history": self.app.tool_list_modification_history,
         }
 

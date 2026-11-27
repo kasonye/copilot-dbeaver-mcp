@@ -524,6 +524,8 @@ public class JdbcBridge {
                 case "QUERY" -> handleQuery(reqId, jdbcUrl, user, pass, targetDb, extraProps, timeoutSec, maxRows, arg1);
                 case "REMEDIATE" -> handleRemediate(
                         reqId, jdbcUrl, user, pass, targetDb, extraProps, timeoutSec, maxRows, dryRun, expectedRows, arg1, arg2);
+                case "SEED" -> handleSeed(
+                        reqId, jdbcUrl, user, pass, targetDb, extraProps, timeoutSec, maxRows, dryRun, arg1, arg2);
                 default -> emitError(reqId, "Unsupported mode: " + mode, null, -1);
             }
         } catch (SQLException sqle) {
@@ -835,6 +837,91 @@ public class JdbcBridge {
                   .append(",\"affectedRows\":").append(affected)
                   .append(",\"columns\":").append(beforeSnap.columnsJson())
                   .append(",\"beforeRows\":").append(beforeSnap.rowsJson())
+                  .append(",\"afterRows\":").append(afterSnap.rowsJson())
+                  .append('}');
+                emitLine(sb.toString());
+            } catch (SQLException e) {
+                try {
+                    conn.rollback();
+                } catch (SQLException ignored) {
+                }
+                throw e;
+            } finally {
+                if (!committed) {
+                    try {
+                        conn.rollback();
+                    } catch (SQLException ignored) {
+                    }
+                }
+            }
+        }
+    }
+
+    private static void handleSeed(
+            String reqId, String jdbcUrl, String user, String pass, String targetDb, String extraProps,
+            int timeoutSec, int maxSeedRows, boolean dryRun, String checkAndVerifySelectSql, String batchInsertsJson)
+            throws Exception {
+        int safeCap = Math.max(1, Math.min(maxSeedRows, 200));
+        Object parsed = new MiniJsonParser(batchInsertsJson).parseValue();
+        if (!(parsed instanceof List<?> insertList) || insertList.isEmpty()) {
+            emitError(reqId, "SEED requires a non-empty JSON array of INSERT statements.", "45000", -1);
+            return;
+        }
+        if (insertList.size() > safeCap) {
+            emitError(reqId, "SEED batch size (" + insertList.size() + ") exceeds max_seed_rows (" + safeCap + ").", "45000", -1);
+            return;
+        }
+
+        try (Connection conn = openResolvedConnection(jdbcUrl, user, pass, targetDb, extraProps, timeoutSec)) {
+            conn.setAutoCommit(false);
+            try {
+                conn.setReadOnly(false);
+            } catch (SQLException ignored) {
+            }
+            boolean committed = false;
+            try (Statement st = conn.createStatement()) {
+                st.setQueryTimeout(Math.max(1, timeoutSec));
+                st.setMaxRows(safeCap + 1);
+
+                // Collision pre-check: ensure none of the target seed primary keys already exist!
+                try (ResultSet rs = st.executeQuery(checkAndVerifySelectSql)) {
+                    QuerySnapshot existing = readResultSet(rs, safeCap);
+                    if (!existing.rows.isEmpty()) {
+                        conn.rollback();
+                        emitError(reqId,
+                                "Seed collision detected: " + existing.rows.size()
+                                        + " row(s) already exist matching target keys. Aborted to protect existing data.",
+                                "23000", -1);
+                        return;
+                    }
+                }
+
+                st.setMaxRows(0);
+                int totalInserted = 0;
+                for (Object item : insertList) {
+                    String insSql = strOrEmpty(item);
+                    totalInserted += st.executeUpdate(insSql);
+                }
+
+                st.setMaxRows(safeCap + 1);
+                QuerySnapshot afterSnap;
+                try (ResultSet rs = st.executeQuery(checkAndVerifySelectSql)) {
+                    afterSnap = readResultSet(rs, safeCap);
+                }
+
+                if (dryRun) {
+                    conn.rollback();
+                } else {
+                    conn.commit();
+                    committed = true;
+                }
+
+                StringBuilder sb = new StringBuilder();
+                sb.append("{\"id\":").append(jsonStr(reqId))
+                  .append(",\"ok\":true,\"dryRun\":").append(dryRun)
+                  .append(",\"committed\":").append(committed)
+                  .append(",\"insertedRows\":").append(totalInserted)
+                  .append(",\"columns\":").append(afterSnap.columnsJson())
                   .append(",\"afterRows\":").append(afterSnap.rowsJson())
                   .append('}');
                 emitLine(sb.toString());

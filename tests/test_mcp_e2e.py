@@ -207,7 +207,7 @@ dbeaver:
             self.assertEqual(init_resp["result"]["serverInfo"]["name"], "db-guard-mcp")
 
             tools_resp = send_rpc(proc, {"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
-            self.assertEqual(len(tools_resp["result"]["tools"]), 10)
+            self.assertEqual(len(tools_resp["result"]["tools"]), 12)
 
             # 1. Read-only query + PII masking on staging-db
             is_err, diag = call_tool(
@@ -320,10 +320,131 @@ dbeaver:
             )
             self.assertFalse(is_err, restored)
 
-            # 5. Verify audit ledger masks PII while tracking all 4 operations
-            is_err, hist = call_tool(proc, 10, "list_modification_history", {"limit": 10})
+            # 5. Test open_ddl_migration_in_dbeaver (blocks DROP TABLE, snapshots schema & writes Flyway file)
+            is_err, bad_ddl = call_tool(
+                proc,
+                10,
+                "open_ddl_migration_in_dbeaver",
+                {
+                    "connection": "localhost",
+                    "table": "customer_orders",
+                    "ddl_sql": "DROP TABLE customer_orders;",
+                    "rollback_ddl_sql": "-- irreversible",
+                    "_skip_gui_for_test": True,
+                },
+            )
+            self.assertTrue(is_err)
+
+            flyway_path = self.tmp_dir / "db" / "migration" / "V2__add_order_remark.sql"
+            is_err, ddl_handoff = call_tool(
+                proc,
+                11,
+                "open_ddl_migration_in_dbeaver",
+                {
+                    "connection": "localhost",
+                    "migration_title": "Add remark column to customer_orders",
+                    "table": "customer_orders",
+                    "ddl_sql": "ALTER TABLE customer_orders ADD COLUMN remark VARCHAR(128);",
+                    "rollback_ddl_sql": "ALTER TABLE customer_orders DROP COLUMN remark;",
+                    "migration_file_path": str(flyway_path),
+                    "_skip_gui_for_test": True,
+                },
+            )
+            self.assertFalse(is_err, ddl_handoff)
+            self.assertTrue(flyway_path.is_file())
+            self.assertTrue(Path(ddl_handoff["rollback_ddl_file"]).is_file())
+
+            # 6. Test seed_dev_test_data (blocked on staging, collision-checked on localhost, 1-click cleanup)
+            seed_rows = [
+                {
+                    "order_id": 9001,
+                    "order_code": "SEED-001",
+                    "order_status": "REJECTED",
+                    "customer_name": "Test User One",
+                    "national_id": "A999999(1)",
+                },
+                {
+                    "order_id": 9002,
+                    "order_code": "SEED-002",
+                    "order_status": "TIMEOUT",
+                    "customer_name": "Test User Two",
+                    "national_id": "B888888(2)",
+                },
+            ]
+            # Blocked on remote staging-db
+            is_err, _ = call_tool(
+                proc,
+                12,
+                "seed_dev_test_data",
+                {"connection": "staging-db", "table": "customer_orders", "rows": seed_rows},
+            )
+            self.assertTrue(is_err)
+
+            # Collision with existing PK 101 must roll back without touching DB
+            is_err, collision = call_tool(
+                proc,
+                13,
+                "seed_dev_test_data",
+                {
+                    "connection": "localhost",
+                    "table": "customer_orders",
+                    "rows": [
+                        {
+                            "order_id": 101,
+                            "order_code": "COLLIDE",
+                            "order_status": "NEW",
+                            "customer_name": "Collide",
+                            "national_id": "C000000(0)",
+                        }
+                    ],
+                },
+            )
+            self.assertTrue(is_err)
+            self.assertIn("collision", collision.get("error", "").lower())
+
+            # Valid seed batch on localhost
+            is_err, seeded = call_tool(
+                proc,
+                14,
+                "seed_dev_test_data",
+                {
+                    "connection": "localhost",
+                    "seed_summary": "Seed rejected & timeout orders for local integration test",
+                    "table": "customer_orders",
+                    "rows": seed_rows,
+                },
+            )
+            self.assertFalse(is_err, seeded)
+            self.assertEqual(seeded["inserted_rows"], 2)
+            self.assertNotIn("Test User One", json.dumps(seeded["seeded_rows"]))
+
+            # Execute 1-click batch cleanup using the returned one_click_cleanup_dml!
+            is_err, cleaned_up = call_tool(
+                proc,
+                15,
+                "apply_remediation",
+                {
+                    "connection": "localhost",
+                    "issue_summary": "Clean up seeded integration test rows",
+                    "table": "customer_orders",
+                    "where_clause": seeded["cleanup_where_clause"],
+                    "dml_sql": seeded["one_click_cleanup_dml"],
+                    "expected_affected_rows": 2,
+                },
+            )
+            self.assertFalse(is_err, cleaned_up)
+            _, verify_zero_seed = call_tool(
+                proc,
+                16,
+                "diagnose_query",
+                {"sql": f"SELECT COUNT(*) FROM customer_orders WHERE {seeded['cleanup_where_clause']}"},
+            )
+            self.assertEqual(verify_zero_seed["rows"][0][0], 0)
+
+            # 7. Verify audit ledger masks PII while tracking all 7 operations
+            is_err, hist = call_tool(proc, 17, "list_modification_history", {"limit": 20})
             self.assertFalse(is_err, hist)
-            self.assertEqual(hist["total_entries"], 4)
+            self.assertEqual(hist["total_entries"], 7)
             md_ledger = Path(hist["audit_markdown_path"]).read_text(encoding="utf-8")
             self.assertNotIn("John Smith", md_ledger)
             self.assertNotIn("B987654", md_ledger)

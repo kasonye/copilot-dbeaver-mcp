@@ -586,3 +586,225 @@ def build_rollback_sql(
         stmts.append(f"SELECT * FROM {table} WHERE {where_clause};")
     stmts.append("COMMIT;")
     return "\n".join(stmts)
+
+
+ALLOWED_DDL_PATTERNS = [
+    re.compile(r"^\s*CREATE\s+TABLE\b", re.IGNORECASE),
+    re.compile(r"^\s*ALTER\s+TABLE\b", re.IGNORECASE),
+    re.compile(r"^\s*CREATE\s+(UNIQUE\s+|FULLTEXT\s+|SPATIAL\s+)?INDEX\b", re.IGNORECASE),
+    re.compile(r"^\s*DROP\s+INDEX\b", re.IGNORECASE),
+    re.compile(r"^\s*CREATE\s+(OR\s+REPLACE\s+)?VIEW\b", re.IGNORECASE),
+    re.compile(r"^\s*COMMENT\s+ON\s+(TABLE|COLUMN)\b", re.IGNORECASE),
+]
+
+FORBIDDEN_CATASTROPHIC_DDL = [
+    (re.compile(r"\bDROP\s+(DATABASE|SCHEMA|TABLE|USER|ROLE)\b", re.IGNORECASE), "Catastrophic DROP (DATABASE/SCHEMA/TABLE/USER) is strictly prohibited."),
+    (re.compile(r"\bTRUNCATE\b", re.IGNORECASE), "TRUNCATE is strictly prohibited in DDL migrations."),
+    (re.compile(r"\b(GRANT|REVOKE)\b", re.IGNORECASE), "Privilege GRANT/REVOKE statements are prohibited."),
+]
+
+
+def split_sql_statements_safe(script: str) -> Tuple[List[str], Optional[str]]:
+    """
+    Splits a multi-statement DDL migration script on top-level semicolons outside
+    quotes and comments, validating no unclosed comments or executable /*! ... */ comments exist.
+    """
+    if not script or not script.strip():
+        return [], "DDL SQL script cannot be empty."
+
+    _, issues = strip_comments_and_literals(script)
+    if issues:
+        return [], "; ".join(issues)
+
+    statements: List[str] = []
+    cur: List[str] = []
+    i = 0
+    n = len(script)
+
+    while i < n:
+        ch = script[i]
+        if ch == "/" and i + 1 < n and script[i + 1] == "*":
+            end = script.find("*/", i + 2)
+            cur.append(script[i : (n if end == -1 else end + 2)])
+            i = n if end == -1 else end + 2
+            continue
+        if ch == "-" and i + 1 < n and script[i + 1] == "-":
+            end = script.find("\n", i + 2)
+            cur.append(script[i : (n if end == -1 else end + 1)])
+            i = n if end == -1 else end + 1
+            continue
+        if ch in ("'", '"', "`"):
+            quote = ch
+            cur.append(ch)
+            i += 1
+            while i < n:
+                c = script[i]
+                cur.append(c)
+                if c == "\\" and quote != "`" and i + 1 < n:
+                    i += 1
+                    cur.append(script[i])
+                    i += 1
+                    continue
+                if c == quote and i + 1 < n and script[i + 1] == quote and quote != "`":
+                    i += 1
+                    cur.append(script[i])
+                    i += 1
+                    continue
+                if c == quote:
+                    i += 1
+                    break
+                i += 1
+            continue
+        if ch == ";":
+            stmt = "".join(cur).strip()
+            if stmt:
+                # Ignore comment-only chunks
+                norm_chunk, _ = strip_comments_and_literals(stmt)
+                if norm_chunk.strip():
+                    statements.append(stmt)
+            cur = []
+            i += 1
+            continue
+
+        cur.append(ch)
+        i += 1
+
+    tail = "".join(cur).strip()
+    if tail:
+        norm_tail, _ = strip_comments_and_literals(tail)
+        if norm_tail.strip():
+            statements.append(tail)
+
+    if not statements:
+        return [], "No executable DDL statements found."
+    return statements, None
+
+
+def validate_ddl_migration_sql(ddl_sql: str) -> Tuple[List[str], List[str], Optional[str]]:
+    """
+    Validates a forward DDL migration script for open_ddl_migration_in_dbeaver.
+    Allows CREATE TABLE, ALTER TABLE, CREATE/DROP INDEX, CREATE VIEW, COMMENT ON.
+    Blocks catastrophic DROP TABLE/DATABASE/SCHEMA, TRUNCATE, GRANT/REVOKE, and DML mutations.
+    Returns (cleaned_statements, risk_warnings, error_msg).
+    """
+    stmts, err = split_sql_statements_safe(ddl_sql)
+    if err:
+        return [], [], err
+
+    warnings: List[str] = []
+    for st in stmts:
+        norm, issues = strip_comments_and_literals(st)
+        if issues:
+            return [], [], "; ".join(issues)
+        norm_stripped = norm.strip()
+
+        for rx, msg in FORBIDDEN_CATASTROPHIC_DDL:
+            if rx.search(norm_stripped):
+                return [], [], msg
+
+        if not any(rx.match(norm_stripped) for rx in ALLOWED_DDL_PATTERNS):
+            return (
+                [],
+                [],
+                f"DDL statement not in allowed list (CREATE TABLE / ALTER TABLE / CREATE|DROP INDEX / CREATE VIEW / COMMENT ON): '{st[:80]}'",
+            )
+
+        if re.search(r"\bDROP\s+COLUMN\b", norm_stripped, re.IGNORECASE):
+            warnings.append("HIGH RISK: ALTER TABLE ... DROP COLUMN detected — verify column data is no longer needed before executing.")
+        if re.search(r"\bMODIFY\s+(COLUMN\s+)?|\bALTER\s+COLUMN\b|\bCHANGE\s+(COLUMN\s+)?", norm_stripped, re.IGNORECASE):
+            warnings.append("CAUTION: Column type/definition change detected — verify existing values will not truncate.")
+
+    return stmts, warnings, None
+
+
+def build_seed_batch_sql(
+    table: str,
+    rows: Sequence[Dict[str, Any]],
+    primary_keys: Sequence[str],
+    max_seed_rows: int = 50,
+    database: str = "",
+) -> Tuple[List[str], str, str, Optional[str]]:
+    """
+    Constructs parameterized-style safe INSERT statements from structured row dicts,
+    plus a collision/verification SELECT query and a consolidated 1-click cleanup rollback.sql.
+    Returns (insert_statements, verify_select_sql, cleanup_rollback_sql, error_msg).
+    """
+    id_err = validate_identifier(table, "table")
+    if id_err:
+        return [], "", "", id_err
+
+    if not rows:
+        return [], "", "", "rows list cannot be empty."
+    if len(rows) > max_seed_rows:
+        return [], "", "", f"Seed batch size ({len(rows)}) exceeds max_seed_rows ({max_seed_rows})."
+
+    if not primary_keys:
+        return (
+            [],
+            "",
+            "",
+            f"Table '{table}' has no detected primary key; cannot guarantee deterministic 1-click seed cleanup.",
+        )
+
+    # Validate consistent column identifiers across all row dicts
+    first_cols = list(rows[0].keys())
+    if not first_cols:
+        return [], "", "", "Row objects cannot be empty."
+
+    for col in first_cols:
+        if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", str(col)):
+            return [], "", "", f"Invalid column name '{col}' in seed rows."
+
+    col_map_lower = {c.lower(): c for c in first_cols}
+    resolved_pks: List[str] = []
+    for pk in primary_keys:
+        actual = col_map_lower.get(pk.lower())
+        if not actual:
+            return (
+                [],
+                "",
+                "",
+                f"Every seed row must explicitly specify primary key column '{pk}' so seeded test data can be tracked and cleaned up safely.",
+            )
+        resolved_pks.append(actual)
+
+    cols_quoted = ", ".join(f"`{c}`" for c in first_cols)
+    insert_stmts: List[str] = []
+    pk_conditions: List[str] = []
+    single_pk_vals: List[str] = []
+
+    for idx, r in enumerate(rows):
+        if set(r.keys()) != set(first_cols):
+            return [], "", "", f"Row at index {idx} has inconsistent columns compared to row 0."
+        for pk in resolved_pks:
+            if r[pk] is None or str(r[pk]).strip() == "":
+                return [], "", "", f"Primary key '{pk}' at row index {idx} cannot be NULL or empty."
+
+        vals_sql = ", ".join(sql_literal(r[c]) for c in first_cols)
+        insert_stmts.append(f"INSERT INTO {table} ({cols_quoted}) VALUES ({vals_sql})")
+
+        if len(resolved_pks) == 1:
+            single_pk_vals.append(sql_literal(r[resolved_pks[0]]))
+        else:
+            and_parts = [f"`{pk}` = {sql_literal(r[pk])}" for pk in resolved_pks]
+            pk_conditions.append("(" + " AND ".join(and_parts) + ")")
+
+    if len(resolved_pks) == 1:
+        where_clause = f"`{resolved_pks[0]}` IN ({', '.join(single_pk_vals)})"
+    else:
+        where_clause = " OR ".join(pk_conditions)
+
+    verify_select_sql = f"SELECT * FROM {table} WHERE {where_clause}"
+    use_stmt = f"USE `{database}`;\n" if database and re.match(r"^[A-Za-z0-9_$-]+$", database) else ""
+    cleanup_sql = "\n".join(
+        [
+            f"-- Auto-generated 1-click cleanup script for {len(rows)} seeded dev test row(s) in {table}",
+            f"{use_stmt}SET autocommit = 0;",
+            "START TRANSACTION;",
+            f"DELETE FROM {table} WHERE {where_clause};",
+            "-- Verify 0 test rows remain before committing:",
+            f"SELECT COUNT(*) AS remaining_seed_rows FROM {table} WHERE {where_clause};",
+            "COMMIT;",
+        ]
+    )
+    return insert_stmts, verify_select_sql, cleanup_sql, None

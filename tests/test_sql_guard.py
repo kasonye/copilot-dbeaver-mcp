@@ -6,6 +6,8 @@ from db_guard.sql_guard import (
     DynamicDataMasker,
     build_insert_backup_sql,
     build_rollback_sql,
+    build_seed_batch_sql,
+    validate_ddl_migration_sql,
     validate_readonly_sql,
     validate_remediation_sql,
 )
@@ -113,6 +115,52 @@ class SqlGuardUnitTests(unittest.TestCase):
         cold_sql = build_insert_backup_sql("orders", cols, before, database="shop_db")
         self.assertIn("USE `shop_db`;", cold_sql)
         self.assertIn("INSERT INTO orders", cold_sql)
+
+    def test_ddl_migration_validator(self) -> None:
+        stmts, warns, err = validate_ddl_migration_sql(
+            "ALTER TABLE orders ADD COLUMN remark VARCHAR(128);\nCREATE INDEX idx_orders_status ON orders(status);"
+        )
+        self.assertIsNone(err)
+        self.assertEqual(len(stmts), 2)
+        self.assertEqual(warns, [])
+
+        # DROP COLUMN allowed with high-risk warning
+        _, drop_col_warns, err2 = validate_ddl_migration_sql("ALTER TABLE orders DROP COLUMN legacy_flag;")
+        self.assertIsNone(err2)
+        self.assertTrue(any("DROP COLUMN" in w for w in drop_col_warns))
+
+        # Catastrophic DDL & DML blocked
+        for bad_ddl in [
+            "DROP TABLE orders;",
+            "DROP DATABASE prod;",
+            "TRUNCATE TABLE orders;",
+            "DELETE FROM orders WHERE id = 1;",
+            "GRANT ALL ON orders TO 'u'@'%';",
+        ]:
+            _, _, b_err = validate_ddl_migration_sql(bad_ddl)
+            self.assertIsNotNone(b_err, f"Failed to block unsafe DDL: {bad_ddl}")
+
+    def test_seed_batch_builder(self) -> None:
+        ins, sel, cleanup, err = build_seed_batch_sql(
+            table="orders",
+            rows=[
+                {"order_id": 9001, "status": "PENDING"},
+                {"order_id": 9002, "status": "SHIPPED"},
+            ],
+            primary_keys=["order_id"],
+        )
+        self.assertIsNone(err)
+        self.assertEqual(len(ins), 2)
+        self.assertEqual(sel, "SELECT * FROM orders WHERE `order_id` IN (9001, 9002)")
+        self.assertIn("DELETE FROM orders WHERE `order_id` IN (9001, 9002);", cleanup)
+
+        # Missing PK column in seed rows must error
+        _, _, _, pk_err = build_seed_batch_sql(
+            table="orders",
+            rows=[{"status": "PENDING"}],
+            primary_keys=["order_id"],
+        )
+        self.assertIsNotNone(pk_err)
 
 
 if __name__ == "__main__":

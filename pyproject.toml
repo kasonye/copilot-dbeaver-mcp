@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "db-guard-mcp"
-version = "1.0.0"
+version = "1.1.0"
 description = "Zero-password DBeaver MCP Server for GitHub Copilot & AI Agents — featuring engine-level READ ONLY locks, dynamic PII masking, rolled-back dry-runs, and mandatory pre-modification backups."
 readme = "README.md"
 license = { text = "MIT" }

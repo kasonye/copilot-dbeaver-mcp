@@ -9,7 +9,7 @@
 
 **DB-Guard MCP** is a zero-password, defense-in-depth **Model Context Protocol (MCP)** server that bridges AI coding assistants (**GitHub Copilot** in IntelliJ IDEA & VS Code, **Cursor**, **Claude Code / Desktop**) with the databases already configured in your local **DBeaver** — across **MariaDB, MySQL, Oracle, PostgreSQL, GaussDB, and H2** on Windows, macOS, and Linux.
 
-It is purpose-built to solve a painful daily engineering workflow: **correlating application error logs + domain code + live database records to rapidly pinpoint bad/corrupted data, preview fixes in rolled-back transactions, and remediate safely with mandatory backups and audit logs.**
+It is purpose-built for **both daily feature development and production-grade incident debugging**: generating code against real schemas, validating query plans, seeding & cleaning up local integration test data, safely reviewing schema migrations (DDL), and remediating corrupted records with mandatory backups and audit logs.
 
 ---
 
@@ -91,7 +91,7 @@ Add `db-guard-mcp` to your global MCP configuration so it works across **every p
 
 ---
 
-## Exposed MCP Tools (10 Tools)
+## Exposed MCP Tools (12 Tools)
 
 | Tool | Mode | Description |
 | :--- | :--- | :--- |
@@ -104,6 +104,8 @@ Add `db-guard-mcp` to your global MCP configuration so it works across **every p
 | `preview_remediation` | Dry-Run (`ROLLBACK`) | Runs target DML inside a rolled-back transaction, returning before/after diffs and generating a DBeaver `.sql` script. |
 | `open_remediation_in_dbeaver` | Backup + Handoff | Backs up original rows + logs the operation, then opens a manual-transaction `.sql` script (`SET autocommit=0; ... ROLLBACK;`) in DBeaver. |
 | `apply_remediation` | Backup + Atomic Commit | Allowed only on `allow_direct_apply_connections` (default: `localhost`). Persists full backups + audit logs before row-count-locked commit. |
+| `open_ddl_migration_in_dbeaver` | Schema Snapshot + DDL Handoff | Validates `CREATE/ALTER TABLE` & `INDEX` DDL (blocks `DROP TABLE/DATABASE`), snapshots existing DDL, optionally writes a Flyway file, and opens DBeaver with paired reverse DDL. |
+| `seed_dev_test_data` | Local Dev Seed + 1-Click Cleanup | Atomically inserts structured test rows on allowed dev connections (with PK collision pre-check) and generates a consolidated `DELETE ... WHERE pk IN (...)` cleanup backup. |
 | `list_modification_history` | Read-Only | Queries chronological modification audit logs, field diffs, backup bundles, and `rollback.sql` paths. |
 
 ---

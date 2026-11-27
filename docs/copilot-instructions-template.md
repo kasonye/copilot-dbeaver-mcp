@@ -15,3 +15,7 @@ You have access to the `db-guard-dbeaver` MCP server, which automatically reuses
    - Always filter `UPDATE` / `DELETE` statements by explicit primary key(s) and run `preview_remediation` (rolled-back dry-run) first.
    - Use `open_remediation_in_dbeaver` for remote/staging/production connections (or manual visual review), or `apply_remediation` for allowed local development connections after user confirmation.
    - Both channels automatically persist full original-row backups (`~/.db-guard-mcp/audit-backups/`) and append audit entries (`~/.db-guard-mcp/change-logs/modification_audit.md`). Always share the resulting `change_id` and `rollback_sql_path` with the user.
+
+4. **Daily Feature Development (Schema Evolution & Test Data Seeding)**:
+   - When adding tables/columns/indexes, use `open_ddl_migration_in_dbeaver` with an explicit `rollback_ddl_sql` (and optional `migration_file_path` for Flyway/Liquibase) so existing table DDL is snapshotted and opened in DBeaver for human execution.
+   - When seeding integration test records on local development DBs, use `seed_dev_test_data` with explicit primary keys, and use the returned `one_click_cleanup_dml` via `apply_remediation` whenever the user asks to clean up the test dataset.

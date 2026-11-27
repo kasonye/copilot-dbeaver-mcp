@@ -286,3 +286,125 @@ class ModificationAuditor:
             "total_entries": len(parsed),
             "entries": recent,
         }
+
+    def record_ddl_migration_backup_and_log(
+        self,
+        *,
+        connection: str,
+        database: str,
+        table: str,
+        migration_title: str,
+        ddl_sql: str,
+        rollback_ddl_sql: str,
+        existing_schema_snapshot: Dict[str, Any],
+        warnings: Sequence[str],
+    ) -> Dict[str, str]:
+        """Persists pre-migration table DDL/column snapshot + reverse rollback DDL before opening DBeaver."""
+        now = dt.datetime.now()
+        date_folder = now.strftime("%Y-%m-%d")
+        change_id = now.strftime("%Y%m%d_%H%M%S_%f")[:19]
+        folder_name = (
+            f"{change_id}_DDL_{_safe_slug(connection, 18)}_"
+            f"{_safe_slug(database or 'default', 18)}_{_safe_slug(table, 24)}"
+        )
+        bundle_dir = self.backup_root / date_folder / folder_name
+        bundle_dir.mkdir(parents=True, exist_ok=True)
+
+        snapshot_json_path = bundle_dir / "before_schema_snapshot.json"
+        before_ddl_path = bundle_dir / "before_table_ddl.sql"
+        rollback_sql_path = bundle_dir / "rollback.sql"
+
+        existing_ddl = existing_schema_snapshot.get("ddl") or (
+            "-- Table did not exist prior to migration (or engine does not expose SHOW CREATE TABLE)."
+        )
+        snapshot_payload = {
+            "change_id": change_id,
+            "created_at": now.isoformat(timespec="seconds"),
+            "channel": "DBEAVER_DDL_HANDOFF",
+            "status": "DDL_SCRIPT_OPENED",
+            "connection": connection,
+            "database": database,
+            "table": table,
+            "migration_title": migration_title,
+            "forward_ddl_sql": ddl_sql,
+            "rollback_ddl_sql": rollback_ddl_sql,
+            "warnings": list(warnings),
+            "existing_schema_snapshot": existing_schema_snapshot,
+        }
+        snapshot_json_path.write_text(
+            json.dumps(snapshot_payload, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        before_ddl_path.write_text(str(existing_ddl) + "\n", encoding="utf-8")
+        rollback_sql_path.write_text(rollback_ddl_sql.strip() + "\n", encoding="utf-8")
+
+        for p in (snapshot_json_path, before_ddl_path, rollback_sql_path):
+            if not p.is_file() or p.stat().st_size == 0:
+                raise RuntimeError(f"Mandatory pre-DDL schema backup failed for {p}")
+
+        return {
+            "change_id": change_id,
+            "bundle_dir": str(bundle_dir),
+            "backup_json_path": str(snapshot_json_path),
+            "insert_sql_path": str(before_ddl_path),
+            "rollback_sql_path": str(rollback_sql_path),
+        }
+
+    def create_seed_cleanup_backup(
+        self,
+        *,
+        connection: str,
+        database: str,
+        table: str,
+        seed_summary: str,
+        insert_statements: Sequence[str],
+        cleanup_rollback_sql: str,
+        columns: Sequence[Dict[str, str]],
+        inserted_rows_unmasked: Sequence[Sequence[Any]],
+    ) -> Dict[str, str]:
+        """Persists seeded row manifest + 1-click DELETE cleanup rollback.sql."""
+        now = dt.datetime.now()
+        date_folder = now.strftime("%Y-%m-%d")
+        change_id = now.strftime("%Y%m%d_%H%M%S_%f")[:19]
+        folder_name = (
+            f"{change_id}_SEED_{_safe_slug(connection, 18)}_"
+            f"{_safe_slug(database or 'default', 18)}_{_safe_slug(table, 24)}"
+        )
+        bundle_dir = self.backup_root / date_folder / folder_name
+        bundle_dir.mkdir(parents=True, exist_ok=True)
+
+        backup_json_path = bundle_dir / "backup_record.json"
+        seed_inserts_path = bundle_dir / "seeded_rows_insert.sql"
+        rollback_sql_path = bundle_dir / "rollback.sql"
+
+        payload = {
+            "change_id": change_id,
+            "created_at": now.isoformat(timespec="seconds"),
+            "channel": "DEV_TEST_SEED",
+            "status": "COMMITTED",
+            "connection": connection,
+            "database": database,
+            "table": table,
+            "seed_summary": seed_summary,
+            "seeded_row_count": len(inserted_rows_unmasked),
+            "columns": list(columns),
+            "inserted_rows_unmasked": [list(r) for r in inserted_rows_unmasked],
+        }
+        backup_json_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        seed_inserts_path.write_text(
+            ";\n".join(insert_statements) + ";\n", encoding="utf-8"
+        )
+        rollback_sql_path.write_text(cleanup_rollback_sql.strip() + "\n", encoding="utf-8")
+
+        for p in (backup_json_path, seed_inserts_path, rollback_sql_path):
+            if not p.is_file() or p.stat().st_size == 0:
+                raise RuntimeError(f"Mandatory seed cleanup backup failed for {p}")
+
+        return {
+            "change_id": change_id,
+            "bundle_dir": str(bundle_dir),
+            "backup_json_path": str(backup_json_path),
+            "insert_sql_path": str(seed_inserts_path),
+            "rollback_sql_path": str(rollback_sql_path),
+        }

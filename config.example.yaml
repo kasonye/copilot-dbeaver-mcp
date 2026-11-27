@@ -21,6 +21,8 @@ security:
   hard_max_rows: 500
   # Circuit breaker: maximum rows a single remediation statement may affect
   max_write_rows: 20
+  # Maximum synthetic test rows a single seed_dev_test_data call may insert on allowed dev DBs
+  max_seed_rows: 50
   # Mask PII columns (IDs, names, phones, emails, secrets) while preserving length & whitespace anomalies
   mask_sensitive_data: true
   extra_sensitive_column_patterns: []

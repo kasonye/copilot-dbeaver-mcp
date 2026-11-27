@@ -343,6 +343,68 @@ ROLLBACK;
     return script_path
 
 
+def write_dbeaver_ddl_migration_script(
+    output_dir: Path,
+    migration_title: str,
+    table: str,
+    ddl_statements: List[str],
+    rollback_ddl_sql: str,
+    warnings: List[str],
+    dbeaver_conn_name: Optional[str] = None,
+    database_name: Optional[str] = None,
+    backup_bundle_dir: Optional[str] = None,
+    project_migration_file: Optional[str] = None,
+) -> Path:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    slug = re.sub(r"[^A-Za-z0-9_-]+", "_", migration_title.strip())[:40].strip("_") or "ddl_migration"
+    script_path = output_dir / f"{ts}_DDL_{slug}.sql"
+
+    use_db_stmt = (
+        f"USE `{database_name}`;\n\n"
+        if database_name and re.match(r"^[A-Za-z0-9_$-]+$", database_name)
+        else ""
+    )
+    warn_block = ""
+    if warnings:
+        warn_lines = "\n".join(f"-- [!] {w}" for w in warnings)
+        warn_block = f"-- ============================================================================\n-- RISK WARNINGS:\n{warn_lines}\n"
+
+    proj_note = f"\n-- Project Migration: {project_migration_file}" if project_migration_file else ""
+    forward_sql = "\n\n".join(s.rstrip(";") + ";" for s in ddl_statements)
+
+    content = f"""-- ============================================================================
+-- DB-Guard Safe Schema Migration (DDL) Review Script
+-- Generated At     : {dt.datetime.now().isoformat(timespec="seconds")}
+-- Migration Title  : {migration_title}
+-- DBeaver Conn     : {dbeaver_conn_name or "(select connection in DBeaver toolbar)"}
+-- Target Database  : {database_name or "(connection default)"}
+-- Target Object    : {table}
+-- Schema Backup Dir: {backup_bundle_dir or "(none)"}{proj_note}
+-- ============================================================================
+-- IMPORTANT DDL NOTE:
+-- In MySQL / MariaDB / Oracle, DDL statements trigger an IMPLICIT COMMIT and
+-- cannot be rolled back with ROLLBACK. Review carefully and execute statement
+-- by statement (Ctrl+Enter) in DBeaver!
+{warn_block}-- ============================================================================
+
+{use_db_stmt}-- [Step 1] Forward DDL Migration Statements (Select & Execute Manually)
+{forward_sql}
+
+-- [Step 2] Post-Migration Structure Verification
+DESCRIBE {table};
+
+-- ============================================================================
+-- [Reverse / Down-Migration Rollback DDL] (Commented out for safety)
+-- ============================================================================
+/*
+{rollback_ddl_sql.strip()}
+*/
+"""
+    script_path.write_text(content, encoding="utf-8")
+    return script_path
+
+
 def launch_script_in_dbeaver(
     script_path: Path,
     dbeaver_conn_name: Optional[str] = None,
